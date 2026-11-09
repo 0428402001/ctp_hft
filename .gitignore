@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------
+# build outputs
+# ---------------------------------------------------------------
+build/
+build-cmake/
+build-mingw/
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exe
+
+# ---------------------------------------------------------------
+# runtime data (log / pid / halt flag / restart requests / shm)
+# ---------------------------------------------------------------
+log/
+flow/
+
+# ---------------------------------------------------------------
+# account credentials -- never commit real configs.
+# commit config/*.ini.example instead (see README section 5).
+# ---------------------------------------------------------------
+config/config.ini
+config/config_live.ini
+config/config_simnow.ini
+config/config_simnow724.ini
+config/config_simnow_demo.ini
+
+# ---------------------------------------------------------------
+# local, machine specific toolchain (see tools/fetch_toolchain.py)
+# ---------------------------------------------------------------
+.toolchain/
+
+# ---------------------------------------------------------------
+# python
+# ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+
+# ---------------------------------------------------------------
+# vendored third-party bookkeeping / windows junk
+# ---------------------------------------------------------------
+third_party/fmtlog/.git_vendored/
+nul

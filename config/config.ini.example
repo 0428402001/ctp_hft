@@ -1,0 +1,112 @@
+; ============================================================================
+;  ctp_hft - configuration
+;  All four processes (md / strategy / trader / query) read this single file.
+;  Lines starting with ';' or '#' are comments.
+; ============================================================================
+
+[account]
+; --- login information -------------------------------------------------------
+broker_id  = 9999
+user_id    = YOUR_USER_ID
+password   = YOUR_PASSWORD
+; investor_id defaults to user_id when left empty
+investor_id =
+; app_id / auth_code are only required by brokers that enforce authentication
+app_id     = simnow_client_test
+auth_code  = 0000000000000000
+product_info = ctp_hft
+
+[md]
+; market data front, e.g. tcp://180.168.146.187:10211
+front      = tcp://182.254.243.31:40011
+; optional extra fronts (comma separated)
+fronts     =
+flow_path  = ./flow/md
+
+[trader]
+; trading front, e.g. tcp://180.168.146.187:10201
+front      = tcp://1182.254.243.31:40001
+fronts     =
+flow_path  = ./flow/trader
+
+[query]
+; the query process uses its own session; by default it shares the trade front
+front      = tcp://182.254.243.31:40011
+fronts     =
+flow_path  = ./flow/query
+; how often account / positions / instruments are refreshed (milliseconds)
+interval_ms = 1000
+
+[general]
+; sim = synthetic market + simulated matching (no broker needed)
+; live = connect to the configured CTP fronts
+mode        = sim
+log_dir     = ./log
+; contracts the strategy trades (comma separated)
+instruments = ag2612
+heartbeat_ms = 500
+; ---- latency tuning (see process_app.cpp applyPerformanceSettings) ------
+; hybrid idle wait: tight _mm_pause spin for spin_us, then SwitchToThread
+; for another spin_us, only then sleep (1 ms granularity, see timeBeginPeriod)
+spin_us      = 200
+; HIGH_PRIORITY_CLASS for all four processes
+high_priority = true
+; optional: pin a process's poll-loop thread to one core (0/absent = off):
+;   [md] cpu = 2  [trader] cpu = 3  [query] cpu = 4  [strategy] cpu = 5
+; CTP worker threads are never pinned, so network callbacks keep their cores.
+
+; ---------------------------------------------------------------------------
+;  simulation only
+; ---------------------------------------------------------------------------
+[sim]
+tick_interval_ms  = 250
+initial_price     = 3500
+price_tick        = 1
+volume_multiple   = 10
+volatility        = 0.0006
+mean_reversion    = 0.05
+spread_ticks      = 1
+; 0 = seed from the wall clock: every run gets a fresh market path
+seed = 0
+initial_balance   = 1000000
+margin_rate       = 0.10
+fee_rate          = 0.0001
+order_latency_ms  = 0
+partial_fills     = true
+
+; ---------------------------------------------------------------------------
+;  strategy
+; ---------------------------------------------------------------------------
+[strategy]
+name = obi_voi
+
+[obi_voi]
+entry_mode         = maker   ; quote the touch on the side of the last print (spread capture)
+; ---------------------------------------------------------------------------
+;  L1 order book imbalance fade strategy
+;  OBI  = (bidVol1 - askVol1) / (bidVol1 + askVol1)
+;  VOI  = EMA(signed aggressor volume) / EMA(|aggressor volume|)
+;  entry: |OBI| > obi_threshold inside window_ticks AND the VOI has crossed
+;         the zero axis against the extreme -> fade on the WEAK side
+;         (buy @ bid1, sell @ ask1, never deeper levels)
+;  entry pull: VOI back into the extreme direction, or entry_timeout_ticks
+;  exit: passive close at the touch; once VOI is against the position for
+;        close_timeout_ticks without a fill -> IOC limit at the opponent price
+;  inventory: net capped at max_position, at the cap closes only
+; ---------------------------------------------------------------------------
+window_ticks       = 12
+obi_threshold      = 0.8
+voi_ema_ticks      = 5
+voi_flip_threshold = 0.4
+entry_timeout_ticks = 30
+entry_slippage_ticks = 0    ; entry crosses 1 tick toward the opponent (buy bid1+1 capped at ask1 / sell ask1-1 capped at bid1) so it fills promptly
+profit_ticks         = 8    ; passive close rests at entry +/- N ticks (fade captures mean reversion)
+close_timeout_ticks = 3
+stop_loss_ticks    = 6     ; price stop: 6 ticks against entry -> cancel TP, IOC stop
+max_hold_ticks     = 60
+trade_volume       = 1
+max_position       = 1
+cooldown_ticks     = 4
+allow_short        = true
+flatten_on_start   = true
+close_on_stop      = true

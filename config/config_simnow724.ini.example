@@ -1,0 +1,148 @@
+; ============================================================================
+;  ctp_hft - SimNow 7x24 configuration (standard CTP 6.7.7柜台)
+;
+;  SimNow 7x24 environment (看穿式前置, uses the monitoring-center production
+;  key mechanism - the AppID/AuthCode below are the official SimNow test pair):
+;      Trade Front  tcp://182.254.243.31:40001
+;      Market Front tcp://182.254.243.31:40011
+;
+;  IMPORTANT - the 7x24 environment is NOT always reachable:
+;      trading days     : open 16:00 -> next day 09:00
+;      non-trading days : open 16:00 -> 12:00
+;      outside those windows connections are refused - use
+;      config_simnow.ini (set 1, 30001/30011) during the day instead.
+;
+;  Run the four processes from build\bin_simnow (standard-CTP flavour):
+;      start_simnow724.bat
+;
+;  flow_path uses separate directories from config_simnow.ini so the two
+;  environments can be switched without CTP stream-file mismatch errors.
+;
+;  Strategy parameters are kept IDENTICAL to config_simnow.ini so the two
+;  environments trade the exact same logic (verified 2026-11-05).
+; ============================================================================
+
+[account]
+broker_id   = 9999
+user_id     = YOUR_USER_ID
+password    = YOUR_PASSWORD
+investor_id = YOUR_INVESTOR_ID
+app_id      = simnow_client_test
+auth_code   = 0000000000000000
+product_info = ctp_hft
+
+[md]
+; 7x24 environment market front (16:00 -> 09:00/12:00, see note above)
+front      = tcp://182.254.243.31:40011
+fronts     =
+flow_path  = ./flow/md724
+
+[trader]
+; 7x24 environment trade front (看穿式前置)
+front      = tcp://182.254.243.31:40001
+fronts     =
+flow_path  = ./flow/trader724
+
+[query]
+; the query process uses a TraderApi session: point it at a TRADE front,
+; not at the market-data front.
+front      = tcp://182.254.243.31:40001
+fronts     =
+flow_path  = ./flow/query724
+interval_ms = 3000
+
+[general]
+; ---- resilience -----------------------------------------------------------
+; login failures never terminate a process: the process retries every
+; startup_retry_ms until the front accepts logins (lunch break, night
+; maintenance, front restart). clean_flow_on_start wipes stale CTP session
+; files of the previous trading day so the first login of a new day works.
+startup_retry       = true
+startup_retry_ms    = 10000
+clean_flow_on_start = true
+mode        = live
+log_dir     = ./log
+instruments = ag2612
+heartbeat_ms = 500
+; latency tuning: hybrid spin wait + HIGH priority (see config.ini)
+spin_us      = 500
+high_priority = true
+
+[strategy]
+name = obi_voi
+
+[obi_voi]
+; ---------------------------------------------------------------------------
+;  L1 order book imbalance fade strategy + BRACKET exits (user spec 2026-11-05)
+;  entry: |OBI| > obi_threshold inside window_ticks AND VOI reversed with at
+;         least voi_entry_threshold magnitude AND the current OBI has receded
+;         from the extreme (decay confirmation) -> fade on the WEAK side
+;  exit : the moment the entry fills a take-profit LIMIT rests at
+;         entry +/- profit_ticks and is NEVER pulled except:
+;           - price reaches stop_loss_ticks against entry -> cancel the TP
+;             and fire an IOC stop crossed stop_slippage_ticks (fills NOW)
+;           - (safety net only) max_hold_ticks held -> cancel + IOC
+;         if the counter auto-kills the resting TP it is re-armed at most
+;         once per tp_repost_interval_ticks, up to tp_repost_max times
+;  inventory: net capped at max_position, at the cap closes only
+; ---------------------------------------------------------------------------
+window_ticks       = 16      ; tightened from 20: the trend filter below now
+                              ;   supplies the quality, so the window can react
+                              ;   faster and fire more often (user asked for
+                              ;   more entries, 2026-11-06)
+obi_threshold      = 0.92    ; 0.95 -> 0.92: the overshoot filter below removes
+                              ;   64 % of the signals, so the threshold is relaxed
+                              ;   a little to keep the trade count up. Offline
+                              ;   replay on 2026-11-06 ticks: 0.95 -> 26 candidates,
+                              ;   0.90 -> 68 (too weak), 0.92 -> ~46
+voi_ema_ticks      = 5
+voi_flip_threshold = 0.35
+voi_entry_threshold = 0.1    ; |VOI| minimum that confirms the reversal (0 = sign only)
+entry_timeout_ticks = 4
+entry_taker        = 1      ; 7x24 front cancels resting quotes in 100-500ms: cross + IOC,
+                            ; so a signal always lands (costs 0-1 tick of slippage)
+profit_ticks       = 8      ; TP limit rests at entry +/- 8 ticks (ag: ~2 ticks of fee must sit inside)
+close_timeout_ticks = 6
+stop_loss_ticks    = 6      ; price stop: touch 6 ticks against entry -> cancel TP, IOC stop
+stop_slippage_ticks = 2     ; a limit IOC prints at the best level that has volume, so the
+                            ;   cross width costs nothing there - it only decides whether the
+                            ;   order still reaches a level with bids/offers. 1 tick missed
+                            ;   the fill outright in the 11:08 run; 2 reaches the next level.
+max_hold_ticks     = 0      ; off - the TP/SL bracket is the exit (safety net only if set)
+max_hold_seconds   = 600    ; HARD wall-clock stop: 10 min holding -> IOC escape at any price
+                            ; (2026-11-05 18:40 an ag short sat open 14 h because its
+                            ;  escape IOC was cancelled and nothing retried it)
+escape_retry_ms    = 800    ; min gap between escape IOC attempts; the cross widens
+                            ; one tick every 3 tries, offset walks 3 -> 4 -> 1
+tp_repost_interval_ticks = 20  ; anti-storm: a resting TP lives 80-300 ms here
+tp_repost_max      = 0      ; 0 = never rest a TP. SimNow cancels every
+                              ;   resting order in 80-300 ms (measured: 8/8 TP
+                              ;   posts per round trip returned status=5), so the
+                              ;   bracket never actually rested - the exit was
+                              ;   always the price-trigger IOC anyway, plus up to
+                              ;   8 dead orders per round trip at the counter
+max_spread_ticks   = 2      ; skip entries while ask1-bid1 > 2 ticks (each extra
+                            ;   tick of spread lengthens the distance to the TP)
+trend_window_ms    = 30000  ; overshoot window (30 s of mid). Measured over 69
+                              ;   real round trips (11-05 724 + 11-06 day, phantom
+                              ;   trips removed): entering AGAINST a 0-5 tick drift
+                              ;   = +40 ticks at 67 % win, against >5 ticks = +16 at
+                              ;   50 %; entering WITH the drift = -153 ticks at 18 %.
+                              ;   The edge is the overshoot, not the direction.
+trend_min_ticks    = 1      ; how far the price must have ALREADY run against the
+                              ;   entry over that window. 1 = a single tick is
+                              ;   enough to prove the move happened
+consec_stop_pause  = 3      ; after 3 losing round trips in a row, stop looking for
+                            ;   entries for pause_seconds. A fade bleeds in a trend;
+                            ;   2026-11-06 11:02-11:04 three shorts stopped -5/-6/-6
+                            ;   inside 100 s while the mid walked 15 ticks up.
+pause_seconds      = 180    ; 5 min -> 3 min: with the trend filter most of
+                              ;   the losing streak cause is gone, so the
+                              ;   stand-down does not need to be this long
+trade_volume       = 1
+max_position       = 1
+cooldown_ticks     = 12     ; 20 -> 12 ticks (~6 s): the filter, not the
+                              ;   cooldown, is what protects quality now
+allow_short        = true
+flatten_on_start   = true
+close_on_stop      = true
