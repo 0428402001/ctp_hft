@@ -581,11 +581,19 @@ python tools\pnl_fifo.py --instr ag2612 --fee-ticks 2 --after 523450
 :: 回合统计：日志只有 HH:MM:SS，跨零点靠反向重建时间线
 python tools\rounds724.py --hours 2
 python tools\rounds724.py --hours 6 --instr ag2612
+
+:: 推代码：本机到 github.com:443 不通，走 api.github.com 的 git-data 接口
+set GITHUB_TOKEN=ghp_xxx                :: classic token，勾 repo
+python tools\gh_push_api.py
 ```
 
 `account_peek` 输出中三个数最关键：`close_profit`（今日已实现）、`commission`（手续费）、
 `net_today = balance − pre_balance`（账户口径净变动）。**策略日志的盈亏和账户口径不一致时，
 以账户为准**。
+
+`gh_push_api.py` 是 `git push` 的替代品：它从 **git 索引**（不是工作区）取 blob，因此 GBK
+源码不会被重新编码、可执行位也不会丢；上传后会校验每个 blob 的 sha 未变、重建的 tree
+与本地一致，再提交并更新 ref。正常情况下远程 commit sha 与本地 `HEAD` **完全相同**。
 
 ## 9. 踩过的坑（都是不变量）
 
