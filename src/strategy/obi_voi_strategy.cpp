@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace hft {
@@ -147,6 +148,9 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
     if (entryBlackoutSec_ < 0) entryBlackoutSec_ = 0;
     if (consecStopPause_ < 0) consecStopPause_ = 0;
     if (pauseSeconds_ < 0) pauseSeconds_ = 0;
+    dailyLossLimitTicks_ = cfg.getInt("obi_voi", "daily_loss_limit_ticks", 0);
+    if (dailyLossLimitTicks_ < 0) dailyLossLimitTicks_ = 0;
+    allowLooseRisk_ = cfg.getBool("obi_voi", "allow_loose_risk", false);
     if (tradeVolume_ < 1 || maxPosition_ < 1) {
         err = "obi_voi: trade_volume and max_position must be >= 1";
         return false;
@@ -155,7 +159,7 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
     HFT_LOGI("obi_voi: mode=%s window=%d obiTh=%.2f voiEma=%d voiFlip=%.2f voiEntry=%.2f | entryTimeout=%dt "
              "entrySlip=%dt taker=%s profit=%dt closeTimeout=%dt stopLoss=%dt stopSlip=%dt maxHold=%dt "
              "tpRepost=%d/%dt maxSpread=%dt trend=%dms/%dt vol=%d maxPos=%d short=%s | maxHoldSec=%d "
-             "escapeRetry=%dms consecStop=%d/%ds stall=%dt/%dw be=%dt blackout=%ds",
+             "escapeRetry=%dms consecStop=%d/%ds stall=%dt/%dw be=%dt blackout=%ds dayLoss=%dt",
              makerMode_ ? "maker" : "fade", windowTicks_, obiThreshold_, voiEmaTicks_,
              voiFlipThreshold_, voiEntryThreshold_, entryTimeoutTicks_, entrySlippageTicks_,
              entryTaker_ ? "ioc" : "gfd",
@@ -164,7 +168,8 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
              trendWindowMs_, trendMinTicks_, tradeVolume_,
              maxPosition_, allowShort_ ? "yes" : "no",
              maxHoldSeconds_, escapeRetryMs_, consecStopPause_, pauseSeconds_,
-             entryStallTicks_, stallWindowTicks_, breakevenTicks_, entryBlackoutSec_);
+             entryStallTicks_, stallWindowTicks_, breakevenTicks_, entryBlackoutSec_,
+             dailyLossLimitTicks_);
     if (!sessions_.empty()) {
         std::string txt;
         char one[32];
@@ -176,7 +181,47 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
         }
         HFT_LOGI("obi_voi: entry windows = %s (everything else: exits only)", txt.c_str());
     }
-    return true;
+    return auditConfig(err);
+}
+
+// Start-up audit. 2026-11-10 cost 1367 CNY in 31 round trips because the live
+// box was still running a config that predated every tuned parameter (day
+// session allowed, spread<=2, tp8/sl6) while the repo held the correct file.
+// A silent mismatch is far more expensive than a refused start, so the three
+// settings that decide the SIGN of the edge are verified here.
+bool ObiVoiStrategy::auditConfig(std::string& err) const {
+    std::string bad;
+    if (maxSpreadTicks_ != 1) {
+        bad += "[max_spread_ticks=" + std::to_string(maxSpreadTicks_) +
+               "] measured on 131k ag ticks: 1 tick -> +4.06 tick/trip, "
+               "2 -> -0.60, 3 -> -2.27. ";
+    }
+    if (sessions_.empty()) {
+        bad += "[trade_sessions empty] day-session entries allowed; every day "
+               "configuration backtests negative (-2.5 .. -4.9 tick/trip). ";
+    }
+    if (profitTicks_ < 12) {
+        bad += "[profit_ticks=" + std::to_string(profitTicks_) +
+               "] at spread<=1: 8 -> -1.18 tick/trip, 16 -> +4.06. ";
+    }
+    if (bad.empty()) return true;
+    if (allowLooseRisk_) {
+        HFT_LOGW("obi_voi: config audit: %s-- allow_loose_risk=1, starting anyway",
+                 bad.c_str());
+        return true;
+    }
+    HFT_LOGE("obi_voi: config audit FAILED: %s", bad.c_str());
+    HFT_LOGE("obi_voi: fix the config, or set [obi_voi] allow_loose_risk = 1 to override "
+             "(only for backtests / experiments)");
+    err = "obi_voi: config audit failed: " + bad;
+    // Do NOT hand this back as a normal start-up failure: [general] startup_retry
+    // would loop forever (it exists to survive a closed front), and a silently
+    // retrying process looks perfectly healthy to a supervisor while trading
+    // nothing. A wrong config on disk will not fix itself - exit now.
+    HFT_LOGE("obi_voi: refusing to start, exiting (2)");
+    Logger::instance().close();  // fmtlog is async: only close() forces the write
+    std::_Exit(2);
+    return false;  // unreachable
 }
 
 ObiVoiStrategy::State& ObiVoiStrategy::state(const char* instrument) {
@@ -352,6 +397,10 @@ void ObiVoiStrategy::updateIndicators(State& st, const TickMsg& tick) {
 void ObiVoiStrategy::onTick(const TickMsg& tick) {
     if (tick.magic != kMagicTick) return;
     if (tick.lastPrice <= 0) return;
+
+    // Exchange trading day first: the loss budget belongs to the day, and a
+    // fresh session must not inherit yesterday's halt.
+    rollTradingDay(tick.tradingDay);
 
     State& st = state(tick.instrument);
     updateIndicators(st, tick);
@@ -638,6 +687,12 @@ void ObiVoiStrategy::evaluate(State& st, const TickMsg& tick) {
     // ... and not in the last minutes of one: a position opened there cannot
     // be closed before the exchange shuts (2026-11-10 14:59:15 entry).
     if (nearSessionEnd(tick)) return;
+
+    // ---- daily loss circuit breaker -----------------------------------------
+    // Checked before anything else that could open a position: once the day's
+    // realised loss reaches the limit, a fade strategy in a trending tape would
+    // otherwise keep buying the same falling knife until the session ends.
+    if (dailyHalted_) return;
 
     // ---- streak guard: stand down while the market is trending against us ---
     if (st.pauseUntilNs) {
@@ -1238,6 +1293,41 @@ void ObiVoiStrategy::resetRoundTrip(State& st) {
 }
 
 // ---------------------------------------------------------------------------
+//  Daily loss budget
+// ---------------------------------------------------------------------------
+// The exchange trading day, not the wall clock: an SHFE night session that starts
+// at 21:00 already belongs to the next trading day, so the budget rolls between
+// the night and the day session instead of in the middle of one of them.
+void ObiVoiStrategy::rollTradingDay(const char* tradingDay) {
+    if (!tradingDay || tradingDay[0] == '\0') return;
+    if (std::strncmp(dailyDay_, tradingDay, kDateLen) == 0) return;
+    const bool hadBudget = dailyDay_[0] != '\0';
+    std::memcpy(dailyDay_, tradingDay, kDateLen);
+    dailyDay_[kDateLen - 1] = '\0';
+    if (hadBudget) {
+        HFT_LOGI("trading day %s: daily loss budget reset (previous day closed at %+.1f ticks, %s)",
+                 dailyDay_, dailyPnlTicks_, dailyHalted_ ? "halted" : "active");
+    }
+    dailyPnlTicks_ = 0.0;
+    dailyHalted_ = false;
+}
+
+// pricePnl is per unit (price difference); volume is in lots.
+void ObiVoiStrategy::bookRoundTrip(double pricePnl, int volume, const char* instrument) {
+    const double ts = ctx_ ? ctx_->priceTick(instrument) : 0.0;
+    if (ts <= 0.0) return;
+    const int lots = volume > 0 ? volume : 1;
+    dailyPnlTicks_ += pricePnl / ts * static_cast<double>(lots);
+    if (dailyLossLimitTicks_ > 0 && !dailyHalted_ &&
+        dailyPnlTicks_ <= -static_cast<double>(dailyLossLimitTicks_)) {
+        dailyHalted_ = true;
+        HFT_LOGW("%s: DAILY LOSS LIMIT reached (%+.1f ticks <= -%d) -> no new entries "
+                 "for the rest of trading day %s; open positions still exit",
+                 instrument, dailyPnlTicks_, dailyLossLimitTicks_, dailyDay_);
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  onExec - everything that depends on an order outcome
 // ---------------------------------------------------------------------------
 void ObiVoiStrategy::onExec(const ExecReport& report) {
@@ -1316,10 +1406,15 @@ void ObiVoiStrategy::onExec(const ExecReport& report) {
                 const double pnl = (st.entryDir == static_cast<char>(Dir::Sell))
                                        ? (st.entryPrice - px)
                                        : (px - st.entryPrice);
-                HFT_LOGI("ROUND TRIP %s closed @ %.2f (entry=%.2f %s, pnl=%+.2f/unit, %s)",
+                // Book it into the trading day before logging, so the log line
+                // carries the running total (and the halt, if this trip tripped it).
+                bookRoundTrip(pnl, report.tradeVolume, report.instrument);
+                HFT_LOGI("ROUND TRIP %s closed @ %.2f (entry=%.2f %s, pnl=%+.2f/unit, %s) "
+                         "| dayPnL=%+.1ft",
                          report.instrument, px, st.entryPrice,
                          st.entryDir == static_cast<char>(Dir::Sell) ? "short" : "long", pnl,
-                         st.pending.kind == OrderKind::CloseIoc ? "IOC escape" : "passive");
+                         st.pending.kind == OrderKind::CloseIoc ? "IOC escape" : "passive",
+                         dailyPnlTicks_);
                 // Streak guard. A fade strategy bleeds exactly when the market
                 // trends: every reversal signal fires, every one gets stopped.
                 // Measured 2026-11-06 11:02-11:04: three shorts stopped at -5,

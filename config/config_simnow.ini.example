@@ -82,12 +82,14 @@ name = obi_voi
 ;  day-session backtest ever turns positive.
 trade_sessions     = 21:00-02:30
 ; Stall filter: price must have come off the recent extreme by N ticks.
-entry_stall_ticks  = 2
+entry_stall_ticks  = 0
 stall_window_ticks = 6
 ; Breakeven ratchet: stop moves to entry after N ticks of profit.
 breakeven_ticks    = 8
 ; No new entries in the last N seconds of a window.
 entry_blackout_sec = 300
+daily_loss_limit_ticks = 40
+allow_loose_risk   = 0
 window_ticks AND VOI reversed with at
 ;         least voi_entry_threshold magnitude AND the current OBI has receded
 ;         from the extreme (decay confirmation) -> fade on the WEAK side

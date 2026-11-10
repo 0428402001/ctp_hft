@@ -315,6 +315,14 @@ private:
     void requestCancel(State& st, const char* instrument);
     void resetRoundTrip(State& st);
 
+    // ---- risk bookkeeping -----------------------------------------------------
+    // Rolls the daily loss budget when tick.tradingDay changes, books a closed
+    // round trip into it, and audits the loaded config at start-up (a silently
+    // stale config is what produced the 2026-11-10 loss).
+    void rollTradingDay(const char* tradingDay);
+    void bookRoundTrip(double pricePnl, int volume, const char* instrument);
+    bool auditConfig(std::string& err) const;
+
     // ---- pricing --------------------------------------------------------------
     double weakSidePrice(const TickMsg& tick, Dir dir) const;  // buy @ bid1, sell @ ask1
     double opponentPrice(const TickMsg& tick, Dir dir) const;  // buy @ ask1, sell @ bid1
@@ -396,13 +404,19 @@ private:
     int trendMinTicks_ = 1;       // required overshoot, in ticks, against the entry
     // Stall filter ("has the impulse actually stopped?"). The 30 s drift filter
     // above only knows that price ran; it cannot tell a 20 s old overshoot from
-    // an impulse that started 2 s ago. Every <= 10 s stop-out in the 2026-11-10
-    // day session (8 trips, -40 ticks) was an entry taken while the extreme was
-    // still being extended. This requires the price to have come back off the
-    // extreme printed in the last stall_window_ticks ticks by entry_stall_ticks.
-    // Backtest on the 131 k tick log: night +4.13 -> +4.53 tick/trade with the
-    // same trades taken (2 ticks off the extreme), day-session bleed halved.
-    int entryStallTicks_ = 2;     // 0 = filter off
+    // an impulse that started 2 s ago.
+    //
+    // DEFAULT OFF (2026-11-10, second measurement). The +4.13 -> +4.53 figure
+    // in the earlier note came from a replay WITHOUT the spread gate. On the
+    // universe this strategy actually trades (spread <= 1 tick, tp16/sl8, night)
+    // waiting for the pullback is destructive, because the signals with the best
+    // forward edge are exactly the ones whose impulse is still extending:
+    //   stall 0 -> 68 trades +4.13/trip   stall 2 -> 66 +3.83
+    //   stall 4 -> 41 +3.95               stall 6 -> 17 +0.50
+    //   stall 8 ->  9 -0.17               stall 10 ->  0 trades
+    // A tight spread already proves the book is liquid, which removes the
+    // "extending into a vacuum" entries this filter was meant to block.
+    int entryStallTicks_ = 0;     // 0 = filter off
     int stallWindowTicks_ = 6;    // look-back for the extreme being faded
     // Breakeven ratchet: after N ticks of profit the stop moves to the entry
     // price, so a round trip that worked cannot turn into a full stop-out.
@@ -417,6 +431,20 @@ private:
     // cooldown (20 ticks ~ 10 s) is far too short to notice one.
     int consecStopPause_ = 0;     // 0 = off
     int pauseSeconds_ = 300;
+    // ---- daily loss circuit breaker -------------------------------------------
+    // Per-trade stops bound one trade; nothing bounded a DAY. Replaying the
+    // 2026-11-10 tape, 31 round trips averaged -1.65 tick and the session simply
+    // kept trading into the same losing regime. Once realised losses for the
+    // trading day reach this many ticks (per lot), no new entries are opened -
+    // existing positions still exit normally through their bracket. Reset when
+    // the exchange trading day rolls (tick.tradingDay), so the night session
+    // and the day session after it are budgeted separately.
+    // 0 = off. 40 ticks ~ 600 CNY on one ag lot, about 0.7 daily sigma.
+    int dailyLossLimitTicks_ = 0;
+    bool allowLooseRisk_ = false;  // boot audit bypass: [obi_voi] allow_loose_risk
+    double dailyPnlTicks_ = 0.0;   // realised, per lot, current trading day
+    char dailyDay_[kDateLen] = {0};
+    bool dailyHalted_ = false;
     // Session gate. The fade edge is not constant over the day: replaying the
     // 23 h of recorded ag2612 ticks (11-05 night + 11-06 day) with cost, the
     // night session paid +259 ticks over 61 trades at 56 % win while the day
