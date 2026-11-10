@@ -36,8 +36,6 @@
 
 #include "hft/strategy_base.h"
 
-#include <deque>
-#include <map>
 #include <string>
 #include <vector>
 
@@ -100,12 +98,54 @@ private:
 
     struct State {
         // ---- market microstructure estimators --------------------------------
-        std::deque<double> obiWin;  // last window_ticks OBI values
-        // Short-horizon mid drift, kept as (timestamp, mid) pairs so the window
-        // is measured in TIME, not ticks: ag2612 ticks at 1-15/s depending on
-        // activity, and a 20-tick window can be either 2 s or 20 s.
-        std::deque<int64_t> midTimesNs;
-        std::deque<double> midWin;
+        // OBI ring: the last window_ticks imbalance values. Fixed 32-slot
+        // ring buffer (power of two) - covers window_ticks <= 32 with ZERO
+        // heap traffic; std::deque allocated a chunk every few pushes and
+        // pointer-chased across the heap on every scan.
+        static constexpr uint32_t kObiRing = 32;
+        double obiRing[kObiRing] = {};
+        uint32_t obiHead = 0;   // next write slot
+        uint32_t obiCount = 0;  // valid entries, <= kObiRing
+        void obiPush(double v) {
+            obiRing[obiHead] = v;
+            obiHead = (obiHead + 1) & (kObiRing - 1);
+            if (obiCount < kObiRing) ++obiCount;
+        }
+        double obiBack() const { return obiRing[(obiHead + kObiRing - 1) & (kObiRing - 1)]; }
+        double obiAt(uint32_t i) const {  // 0 = oldest valid entry
+            return obiRing[(obiHead + kObiRing - obiCount + i) & (kObiRing - 1)];
+        }
+
+        // Short-horizon mid drift, kept as ONE CHECKPOINT PER SECOND in a
+        // 32-slot ring: 32 s of history covers the 30 s trend window at any
+        // tick rate (ag2612 ticks at 1-15/s; a per-tick deque needed up to
+        // 450 entries for the same window). The window is measured in TIME,
+        // not ticks, and the checkpoints keep the per-tick update O(1) with
+        // no allocation.
+        static constexpr uint32_t kMidCkpts = 32;
+        struct MidCkpt { int64_t ns = 0; double mid = 0.0; };
+        MidCkpt midCk[kMidCkpts] = {};
+        uint32_t midHead = 0;
+        uint32_t midCount = 0;
+        void midUpdate(int64_t ts, double mid) {
+            if (midCount > 0) {
+                MidCkpt& last = midCk[(midHead + kMidCkpts - 1) % kMidCkpts];
+                if (ts - last.ns < INT64_C(1000000000)) {
+                    // refresh the current second: the right edge of the drift
+                    // window always tracks the latest tick
+                    last.ns = ts;
+                    last.mid = mid;
+                    return;
+                }
+            }
+            midCk[midHead].ns = ts;
+            midCk[midHead].mid = mid;
+            midHead = (midHead + 1) % kMidCkpts;
+            if (midCount < kMidCkpts) ++midCount;
+        }
+        const MidCkpt& midCkAt(uint32_t i) const {  // 0 = oldest
+            return midCk[(midHead + kMidCkpts - midCount + i) % kMidCkpts];
+        }
         double prevPrice = 0.0;
         double prevVolume = 0.0;    // CTP volume is a cumulative double
         double voiSum = 0.0;        // EMA of signed aggressor volume
@@ -124,6 +164,12 @@ private:
         double entryPrice = 0.0;
         char entryDir = '0';
         int64_t openTimeNs = 0;
+        // Bracket prices, computed ONCE when the entry fill is booked (see
+        // armBracket): the tick loop then only compares the touch against
+        // these, instead of redoing tickSize math on every tick.
+        double tpTrigger = 0.0;   // unrounded: entry +/- profit_ticks * tick
+        double slTrigger = 0.0;   // unrounded: entry -/+ stop_loss_ticks * tick (0 = off)
+        double tpPrice = 0.0;     // roundToTick(tpTrigger) - resting TP limit
         int adverseTicks = 0;        // consecutive ticks with VOI against the position
         int escapeRetries = 0;
         // An escape IOC is the last line of defence: it has to keep being
@@ -162,7 +208,26 @@ private:
         int roundsSeen = 0;
         int staleBrokerRounds = 0;
         int flatBrokerRounds = 0;   // broker reports flat while local holds
-        std::deque<CloseLeg> flattenLegs;
+        // Flatten legs: a position splits into at most 4 buckets (long/short x
+        // today/yesterday). Fixed ring, never allocates.
+        static constexpr uint32_t kMaxFlattenLegs = 8;
+        CloseLeg flattenLegs[kMaxFlattenLegs] = {};
+        uint32_t flattenHead = 0;
+        uint32_t flattenCount = 0;
+        bool flattenEmpty() const { return flattenCount == 0; }
+        uint32_t flattenSize() const { return flattenCount; }
+        void flattenClear() { flattenHead = 0; flattenCount = 0; }
+        void flattenPush(const CloseLeg& leg) {
+            if (flattenCount >= kMaxFlattenLegs) return;  // cannot happen (4 max)
+            flattenLegs[(flattenHead + flattenCount) % kMaxFlattenLegs] = leg;
+            ++flattenCount;
+        }
+        const CloseLeg& flattenFront() const { return flattenLegs[flattenHead]; }
+        void flattenPop() {
+            if (flattenCount == 0) return;
+            flattenHead = (flattenHead + 1) % kMaxFlattenLegs;
+            --flattenCount;
+        }
         // flatten backoff: a position the matcher keeps rejecting (50 AND 51)
         // is a 7x24 replay phantom - retrying every tick only churns orders
         int flattenFails = 0;
@@ -177,6 +242,7 @@ private:
     };
 
     State& state(const char* instrument);
+    State* findState(const char* instrument);
 
     // ---- indicator update (called first in onTick) --------------------------
     void updateIndicators(State& st, const TickMsg& tick);
@@ -211,6 +277,9 @@ private:
     double weakSidePrice(const TickMsg& tick, Dir dir) const;  // buy @ bid1, sell @ ask1
     double opponentPrice(const TickMsg& tick, Dir dir) const;  // buy @ ask1, sell @ bid1
     double roundToTick(double price, double tickSize) const;
+    // Computes the bracket (tp/sl trigger + resting TP limit) from the entry
+    // price. Called ONCE per round trip, the moment the entry fill is booked.
+    void armBracket(State& st, double tickSize);
     // true when the exit touch is stop_loss_ticks or further against entry
     bool stopLossHit(const State& st, const TickMsg& tick, int net) const;
     // Mid drift over trend_window_ms, expressed in ticks. Only meaningful once
@@ -288,6 +357,17 @@ private:
     // cooldown (20 ticks ~ 10 s) is far too short to notice one.
     int consecStopPause_ = 0;     // 0 = off
     int pauseSeconds_ = 300;
+    // Session gate. The fade edge is not constant over the day: replaying the
+    // 23 h of recorded ag2612 ticks (11-05 night + 11-06 day) with cost, the
+    // night session paid +259 ticks over 61 trades at 56 % win while the day
+    // session lost -116 over 24 trades, and NO tp/sl pair in the grid made the
+    // day session positive (-3.5 .. -6.2 tick/trade). Entry seeking is
+    // therefore restricted to the windows listed here; exits are never gated
+    // (a position must always be closable).
+    // Format: "HH:MM-HH:MM[,HH:MM-HH:MM]", a window may cross midnight.
+    // Empty = 24 h (old behaviour).
+    std::vector<std::pair<int, int>> sessions_;   // seconds of day, [from, to)
+    bool inSession(const TickMsg& tick) const;
     int tradeVolume_ = 1;
     int maxPosition_ = 1;
     int cooldownTicks_ = 5;
@@ -299,7 +379,17 @@ private:
     static constexpr int kStaleRounds = 2;
     static constexpr int kMaxEscapeRetries = 200;
 
-    std::map<std::string, State> states_;
+    // Per-instrument states in a FIXED table: a strategy trades a handful of
+    // instruments, so a 16-slot array + linear scan replaces a std::map
+    // (which allocated a node and built a std::string key on EVERY tick).
+    static constexpr uint32_t kMaxStates = 16;
+    struct StateEntry {
+        char instrument[kInstrumentLen];
+        State st;
+    };
+    StateEntry states_[kMaxStates];
+    uint32_t statesN_ = 0;
+    State overflowState_;  // returned if the table ever overruns (logged)
 };
 
 } // namespace hft

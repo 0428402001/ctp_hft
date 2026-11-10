@@ -72,6 +72,13 @@ protected:
     // Handles are collected once after onStart().
     virtual void collectWaitHandles(std::vector<void*>& handles) { (void)handles; }
 
+    // How long the idle path may block on the inbound events before polling
+    // again anyway - the ONLY source of periodic wake-ups. Override with the
+    // cadence of the process' own timer work (e.g. the strategy's 1 s
+    // onTimer), so the loop is purely event driven between timer ticks:
+    // a message wakes it in microseconds, otherwise it sleeps the full span.
+    virtual int64_t maxWaitNs() const { return 1000000000ll; }
+
     // ---- performance setup -------------------------------------------------
     // Called from run() before the poll loop starts:
     //   * timeBeginPeriod(1)            - Windows sleep granularity 15 ms -> ~1 ms

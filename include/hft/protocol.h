@@ -84,7 +84,12 @@ struct TickMsg {
     double openInterest;
     int64_t recvTimeNs;                  // when the gateway saw the tick
     int64_t publishTimeNs;               // when it hit the ring buffer
+    // Page locality: 256 B per slot means exactly 16 slots per 4 KiB page, so
+    // walking the ring crosses a page boundary only every 16 ticks and no
+    // slot ever straddles two pages (two pages = two TLB entries per read).
+    char _reserved[32];
 };
+static_assert(sizeof(TickMsg) == 256, "TickMsg must stay a 4 KiB factor");
 
 // ---------------------------------------------------------------------------
 // 2) Strategy process -> trading process
@@ -134,7 +139,9 @@ struct OrderCommand {
     char orderSysID[kOrderSysIdLen];
     int32_t frontID;
     int32_t sessionID;
+    char _reserved[88];                  // pad to 256 B (16 slots / page)
 };
+static_assert(sizeof(OrderCommand) == 256, "OrderCommand must stay a 4 KiB factor");
 
 // ---------------------------------------------------------------------------
 // 3) Trading process -> strategy process (order/trade feedback)
@@ -196,7 +203,9 @@ struct ExecReport {
     char errorMsg[kMsgLen];
     char statusMsg[kMsgLen];
     int64_t rtnTimeNs;
+    char _reserved[72];                  // pad to 512 B (8 slots / page)
 };
+static_assert(sizeof(ExecReport) == 512, "ExecReport must stay a 4 KiB factor");
 
 // ---------------------------------------------------------------------------
 // 4) Strategy process <-> query process
@@ -219,7 +228,9 @@ struct QueryRequest {
     QueryType type;
     char instrument[kInstrumentLen];
     int64_t sendTimeNs;
+    char _reserved[8];                   // pad to one cache line (64 B)
 };
+static_assert(sizeof(QueryRequest) == 64, "QueryRequest must stay one cache line");
 
 struct AccountSnap {
     double preBalance;
@@ -282,7 +293,9 @@ struct QueryResponse {
     PositionSnap position;
     InstrumentSnap instrument;
     int64_t rtnTimeNs;
+    char _reserved[8];                   // pad to 512 B (8 slots / page)
 };
+static_assert(sizeof(QueryResponse) == 512, "QueryResponse must stay a 4 KiB factor");
 
 // ---------------------------------------------------------------------------
 // Shared snapshot maintained by the query process (seqlock protected)

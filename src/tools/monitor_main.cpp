@@ -125,7 +125,8 @@ int main(int argc, char** argv) {
 
         hr("positions");
         std::printf("%-14s %6s %8s %8s %14s\n", "INSTRUMENT", "DIR", "QTY", "TODAY", "AVG COST");
-        for (const auto& p : rd.positions()) {
+        for (uint32_t i = 0; i < rd.positionCount(); ++i) {
+            const hft::PositionSnap& p = rd.positions()[i];
             if (p.position == 0) continue;
             std::printf("%-14s %6s %8d %8d %14.2f\n", p.instrument,
                         p.direction == '2' ? "LONG" : "SHORT", p.position, p.todayPosition,

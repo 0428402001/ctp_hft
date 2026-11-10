@@ -38,7 +38,12 @@ static const char* roleSection(Role r) {
 }
 
 void ProcessApp::applyPerformanceSettings() {
-    spinUs_ = cfg_.getInt("general", "spin_us", 200);
+    // spin_us = 0 (default): pure event driven. The idle path goes straight
+    // to the kernel events; a producer's doorbell wakes the loop in
+    // microseconds. A positive spin_us keeps the old hybrid: burn up to N us
+    // in _mm_pause before blocking (shaves a fraction of a microsecond off
+    // the pickup latency at the price of a fully busy core while idling).
+    spinUs_ = cfg_.getInt("general", "spin_us", 0);
     idleUs_ = idleSleepUs();
 
 #if defined(HFT_WINDOWS)
@@ -272,23 +277,22 @@ int ProcessApp::run() {
     collectWaitHandles(waitHandles_);
     waitHandles_.erase(std::remove(waitHandles_.begin(), waitHandles_.end(), nullptr),
                        waitHandles_.end());
-    // Wakeup budget when blocked on the events: the poll loop still needs to
-    // run periodically for timers (strategy 1 s cadence), so never block
-    // longer than a few milliseconds.
+    // The block length on the kernel events is the process' timer cadence
+    // (maxWaitNs), NOT a fixed poll interval: with no traffic the loop sleeps
+    // the whole span at 0% CPU, and any doorbell rings it awake immediately.
+    int64_t maxWait = maxWaitNs();
+    if (maxWait <= 0) maxWait = 1000000ll;  // at least 1 ms
     const uint32_t waitMs =
-        static_cast<uint32_t>(idleUs_ > 0 ? ((idleUs_ + 999) / 1000) : 1);
+        static_cast<uint32_t>(std::min<int64_t>(maxWait / 1000000ll, 60000ll));
 
     // ---- hybrid wait --------------------------------------------------------
     // Phase machine for the idle path (reset to phase 0 whenever onPoll()
     // does useful work):
-    //   phase 0  tight spin, _mm_pause          [0, spin_us)   - sub-µs pickup
+    //   phase 0  tight spin, _mm_pause          [0, spin_us)   - only when
+    //            spin_us > 0; the default (0) skips this entirely
     //   phase 1  block on the inbound channel events (waitMs timeout); a
     //            producer's SetEvent wakes us in microseconds; without
-    //            events this degrades to a timed sleep.
-    // NOTE a plain sub-millisecond sleep is useless on Windows: sleep_for(µs)
-    // rounds down to Sleep(0), which yields the timeslice WITHOUT blocking -
-    // i.e. a full-core spin. That is why the idle path must go through the
-    // kernel objects (or sleep whole milliseconds).
+    //            events this degrades to a single timed sleep of waitMs.
     const int64_t spinNs = static_cast<int64_t>(spinUs_) * 1000;
     bool idle = false;
     int64_t idleStartNs = 0;
@@ -321,13 +325,13 @@ int ProcessApp::run() {
             ::WaitForMultipleObjects(n, reinterpret_cast<const HANDLE*>(waitHandles_.data()),
                                      FALSE, waitMs);
 #else
-            sleepUs(static_cast<uint32_t>(idleUs_));
+            sleepUs(static_cast<uint32_t>(std::min<int64_t>(maxWait, INT64_C(60000000)) /
+                                          1000ll));
 #endif
         } else {
-            // No inbound events (e.g. the md process in sim mode is paced by
-            // its own tick generator): plain timed sleep, whole milliseconds.
-            const int slUs = (idleUs_ > 0 && idleUs_ >= 1000) ? idleUs_ : 1000;
-            sleepUs(static_cast<uint32_t>(slUs));
+            // No inbound events (e.g. the md process: its producer thread
+            // lives inside the CTP DLL): plain timed sleep, whole milliseconds.
+            sleepMs(waitMs);
         }
         idle = false;  // re-evaluate immediately after a wake
     }

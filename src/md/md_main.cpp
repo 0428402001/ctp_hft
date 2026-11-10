@@ -99,6 +99,17 @@ protected:
 
     int idleSleepUs() const override { return simulation() ? 500 : 5000; }
 
+    // Live: the CTP worker thread pushes ticks on its own; the main loop only
+    // prints stats every 5 s, so it may sleep that long. Sim: the main loop
+    // IS the tick generator - wake exactly when the next tick is due.
+    int64_t maxWaitNs() const override {
+        if (simulation()) {
+            const int64_t ms = sim_.msUntilNextTick();
+            return (ms > 0 ? ms : 1) * 1000000ll;
+        }
+        return 5000000000ll;
+    }
+
 private:
     void publish(const TickMsg& t) {
         if (!channels().pushTick(t)) {

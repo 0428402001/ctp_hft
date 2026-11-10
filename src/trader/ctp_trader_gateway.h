@@ -107,6 +107,11 @@ private:
     std::atomic<bool> settleConfirmed_{false};
 #endif
     std::atomic<int> requestId_{0};
+    // CTP worker-thread CPU pinning ([trader] ctp_cpu, -1 = off): applied
+    // from inside the first order/trade callback, because the thread belongs
+    // to the SDK.
+    std::atomic<int> workerPin_{0};
+    int workerCpu_ = -1;
     int orderRefBase_ = 1;
     int frontId_ = 0;
     int sessionId_ = 0;

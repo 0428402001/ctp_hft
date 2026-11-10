@@ -1,6 +1,32 @@
 // SPDX-License-Identifier: MIT
 #include "hft/shm.h"
 
+#include <cstdio>
+
+#if defined(HFT_WINDOWS)
+namespace {
+// Best effort: keep the mapped ring pages resident so a process that has been
+// idle for a while does not take soft page faults on the first tick after a
+// quiet stretch (the classic "first message of the session is the slowest"
+// effect). Raising the working-set ceiling first lets VirtualLock cover the
+// ~11 MB of channel rings under the default quota. Never fatal.
+void tryLockPages(void* addr, uint64_t size) {
+    static const bool quotaRaised = [] {
+        return ::SetProcessWorkingSetSize(::GetCurrentProcess(),
+                                          static_cast<SIZE_T>(32) * 1024 * 1024,
+                                          static_cast<SIZE_T>(256) * 1024 * 1024) != 0;
+    }();
+    (void)quotaRaised;
+    if (!::VirtualLock(addr, static_cast<SIZE_T>(size))) {
+        std::fprintf(stderr,
+                     "shm: VirtualLock(%llu bytes) failed (err=%lu) - continuing unlocked\n",
+                     static_cast<unsigned long long>(size),
+                     static_cast<unsigned long>(::GetLastError()));
+    }
+}
+} // namespace
+#endif
+
 namespace hft {
 
 void SharedMemory::setError(const char* what) {
@@ -65,6 +91,7 @@ bool SharedMemory::create(const std::string& name, uint64_t size) {
         handle_ = nullptr;
         return false;
     }
+    tryLockPages(addr_, size_);
 #else
     shmName_ = "/" + name;
     fd_ = ::shm_open(shmName_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0666);
@@ -115,6 +142,7 @@ bool SharedMemory::open(const std::string& name, uint64_t size) {
         handle_ = nullptr;
         return false;
     }
+    tryLockPages(addr_, size_);
 #else
     shmName_ = "/" + name;
     fd_ = ::shm_open(shmName_.c_str(), O_RDWR, 0666);

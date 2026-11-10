@@ -79,15 +79,41 @@ python tools\rounds724.py --hours 2
 每条队列通道额外挂一个**内核事件对象**（`ChannelEvent`，Windows auto-reset Event）：
 生产者在队列**空→非空**转换时 `SetEvent`（忙时消费者零 syscall），消费者空闲时
 `WaitForMultipleObjects` 阻塞在入站事件上——新消息**微秒级唤醒**且空闲 CPU ≈ 0%。
-主循环空闲路径为两阶段：先自旋 `spin_us`（吃突发序列），再阻塞等事件（超时
-1 ms 兜底定时器任务）。
+主循环空闲路径为两阶段：先自旋 `spin_us`（吃突发序列），再阻塞等事件（超时上限
+由每个进程的 `maxWaitNs()` 决定，兜底心跳/定时器任务）。`spin_us` 默认 **0**
+——纯事件驱动，实测 sim 行情持续推 tick 时四个进程 CPU 合计 ≈ 0.1%。
 
 ```ini
 [general]
-spin_us      = 500    ; 空闲先自旋的时长（µs）
+spin_us      = 0      ; 空闲先自旋的时长（µs），默认 0 = 纯事件驱动
 high_priority = true  ; 四进程 HIGH_PRIORITY_CLASS
-; [md] cpu = 2  [trader] cpu = 3  ...  ; 可选：绑主循环线程到指定核心
+; [md] cpu = 0  [trader] cpu = 3  ...  ; 可选：绑主循环线程到指定核心
+; [md] ctp_cpu = 1  [trader] ctp_cpu = 3  ; 可选：绑 CTP 回调线程（见 2.2）
 ```
+
+### 2.2 性能工程（2026-11 这轮做的六件事）
+
+1. **事件驱动**：见上。等待上限按角色区分——策略/查询 1 s、trader live 5 s / sim 2 ms、
+   md sim 精确睡到下一个 tick（`msUntilNextTick()`）。
+2. **CPU 亲和**：主循环线程按 `[role] cpu` 钉核；CTP SDK 自建回调线程不属于我们，
+   用 `thread_pin.h` 的 `pinCurrentThreadOnce` 在**首次回调内**自钉到 `ctp_cpu`。
+   4 核示例：md 主 + query 主 = 0、md CTP = 1、strategy = 2、trader 主 + CTP = 3。
+3. **热路径零分配**：策略上下文的 4 个 `std::map<std::string,…>` 换成 16 槽固定数组
+   + strncmp 线性扫描；`SnapshotReader` 用预分配 `PositionSnap[512]` 替代 vector；
+   合约表改惰性缓存直读 SHM（不再每秒拷贝 4096 行）。tick 回调路径上没有 new。
+4. **全限价单 + 括号价预计算**：所有订单限价（IOC 也是限价 IOC）；`armBracket()` 在
+   入场成交时一次算好 `tpTrigger / slTrigger / tpPrice`，tick 回调只剩纯数值比较，
+   语义与原乘除比较逐位等价。
+5. **只留短历史**：策略三处 deque 换固定环形缓存——OBI 窗口 `obiRing[32]`（2 幂掩码）、
+   30 s 中价漂移窗口改 32 槽**秒级检查点环**（每个检查点原地刷新，内存降一个数量级，
+   窗口左边界误差 ±1 s 可接受）、平仓腿 `flattenLegs[8]`。
+6. **页局部性**：消息体全部填充到 4 KiB 因子（TickMsg / OrderCommand 256 B、
+   ExecReport / QueryResponse 512 B、QueryRequest 64 B，`static_assert` 锁死防回退）；
+   环形队列槽数组 `alignas(4096)` 页对齐；SHM 映射后 `VirtualLock` 锁页防换出
+   （先 `SetProcessWorkingSetSize` 抬配额，best-effort，失败只打 stderr）。
+
+实测（sim 100 ms 行情、四进程全开）：tick→策略处理 ~33–50 µs，队列回压 0，
+md/strategy/query CPU ≈ 0.000%，trader 0.104%（仅成交回报的实际计算量）。
 
 > Windows 陷阱：`sleep_for(<1ms)` 会退化成 `Sleep(0)`——只让出时间片不阻塞，
 > 等于全速自旋烧满一个核。本框架空闲等待一律走内核事件或整毫秒睡眠
@@ -258,16 +284,26 @@ startup_retry       = true  ; 登录失败不退出，按 startup_retry_ms 重�
 startup_retry_ms    = 10000
 clean_flow_on_start = true  ; 清掉上一交易日的会话流文件
 heartbeat_ms = 500
-spin_us      = 500
+spin_us      = 0              ; 0 = 纯事件驱动（推荐）；>0 时空闲先自旋 N µs
 high_priority = true
+
+; CPU 亲和（可选）：主循环线程 cpu，CTP 回调线程 ctp_cpu（线程归 SDK 创建，首回调自钉）
+; [md] cpu = 0  ctp_cpu = 1
+; [strategy] cpu = 2
+; [trader] cpu = 3  ctp_cpu = 3
+; [query] cpu = 0
 
 [strategy]
 name = obi_voi
 
 [obi_voi]
+; ---- 时段闸门 ----
+trade_sessions      = 21:00-02:30  ; 只在这些窗口内开新仓（逗号可分隔多段），其余时间只平仓
+                                   ; 依据：13.18 万 tick 回放，夜盘 +4.13 tick/笔、日盘 −4.89 tick/笔
+
 ; ---- 信号 ----
-window_ticks        = 20    ; OBI 极端判定回看窗口（tick）
-obi_threshold       = 0.95  ; |OBI| 超过它算极端
+window_ticks        = 10    ; OBI 极端判定回看窗口（tick，上限 32 = obiRing 容量）
+obi_threshold       = 0.90  ; |OBI| 超过它算极端
 voi_ema_ticks       = 5     ; VOI 平滑
 voi_flip_threshold  = 0.35  ; VOI“明确反向”的幅度
 voi_entry_threshold = 0.1   ; 入场要求的最小 |VOI|
@@ -277,11 +313,11 @@ cooldown_ticks      = 20    ; 回合结束后的冷却
 entry_timeout_ticks  = 4    ; 挂单 N tick 未成交 -> 撤
 entry_slippage_ticks = 1    ; 主动入场时向对手价多跨 N tick（成交在对手价，跨价几乎免费）
 entry_taker          = 1    ; 1 = 跨对手价 + IOC（前置会秒撤挂单，必须 taker）
-max_spread_ticks     = 2    ; 价差超过 N tick 就不入场（目标价从成交价起算，价差直接吃边际）
+max_spread_ticks     = 1    ; 价差超过 N tick 就不入场（目标价从成交价起算，价差直接吃边际）
 
 ; ---- 括号单退出 ----
-profit_ticks      = 8       ; 止盈限价挂在 entry ± 8 tick，GFD，永不主动撤
-stop_loss_ticks   = 6       ; 价格逆向触碰 6 tick -> 撤 TP + IOC 止损
+profit_ticks      = 16      ; 止盈限价挂在 entry ± 16 tick，GFD，永不主动撤
+stop_loss_ticks   = 8       ; 价格逆向触碰 8 tick -> 撤 TP + IOC 止损
 stop_slippage_ticks = 2     ; 止损 IOC 再多跨 2 tick（限价单仍按对手价成交，只保证够到有量的档）
 close_timeout_ticks = 6     ; 平仓被动单的 VOI 反向超时
 tp_repost_interval_ticks = 20   ; TP 被外部撤掉后，最快每 20 tick 补挂一次
@@ -523,7 +559,10 @@ build\bin\strategy_proc.exe --config config\config_simnow.ini
   反过来，入场只跨 1 跳即可（跨太多只会在盘口薄时吃到更差的一档）；
 * **成交即记录 `entryPrice`**，即使回报没能匹配到在途单槽：早期版本只在 `tracked`
   时写 `entryPrice`，11-06 11:02 那笔空单因此把止盈挂在了**盘口价**（12453）而不是
-  目标价（12447）——等于把整个 fade 边际送给了价差。
+  目标价（12447）——等于把整个 fade 边际送给了价差；
+* **括号价在入场成交时一次算好**（`armBracket`）：`tpTrigger / slTrigger / tpPrice`
+  落进 State，之后每个 tick 只做纯数值比较（`touch >= tpTrigger − ε`），
+  热路径上没有乘除、没有取整、没有分支外的计算。
 
 **真实日志样例（2026-11-06 11:14，taker 入场 + 修好的止盈价）：**
 
@@ -541,11 +580,14 @@ build\bin\strategy_proc.exe --config config\config_simnow.ini
 启动日志会打印生效参数，换版本后第一件事就是核对这一行：
 
 ```
-obi_voi: mode=fade window=20 obiTh=0.95 voiEma=5 voiFlip=0.35 voiEntry=0.10 |
-entryTimeout=4t entrySlip=1t taker=ioc profit=8t closeTimeout=6t stopLoss=6t stopSlip=2t
-maxHold=0t tpRepost=8/20t maxSpread=2t vol=1 maxPos=1 short=yes |
-maxHoldSec=600 escapeRetry=800ms consecStop=3/300s
+obi_voi: mode=fade window=10 obiTh=0.90 voiEma=5 voiFlip=0.35 voiEntry=0.10 |
+entryTimeout=4t entrySlip=1t taker=ioc profit=16t closeTimeout=6t stopLoss=8t stopSlip=2t
+maxHold=0t tpRepost=0/20t maxSpread=1t trend=30000ms/1t vol=1 maxPos=1 short=yes |
+maxHoldSec=600 escapeRetry=800ms consecStop=3/180s
+obi_voi: entry windows = 21:00-02:30 (everything else: exits only)
 ```
+
+第二行是时段闸门：窗口外收到信号只记日志不下单（白天已实测 0 信号）。
 
 ### 7.4 2026-11-06 的实测与结论
 
@@ -581,6 +623,15 @@ python tools\pnl_fifo.py --instr ag2612 --fee-ticks 2 --after 523450
 :: 回合统计：日志只有 HH:MM:SS，跨零点靠反向重建时间线
 python tools\rounds724.py --hours 2
 python tools\rounds724.py --hours 6 --instr ag2612
+
+:: 当日柜台实况（资金/持仓/成交/报单 + FIFO 回合 + 每合约跳数金额）
+:: 注意：CTP 的 ReqQryTrade 只能查当前交易日，隔夜成交柜台取不到
+build\bin_simnow\qry_today.exe --config config\config_simnow724.ini
+tools\qry_poll.sh     :: 前置不可用时按间隔重试（SimNow 停摆时守开盘用）
+tools\qry_watch.sh    :: 多前置轮询版
+
+:: 策略回测：本机录的 tick 数据回放参数网格（含费用）
+python tools\bt_sweep.py
 
 :: 推代码：本机到 github.com:443 不通，走 api.github.com 的 git-data 接口
 set GITHUB_TOKEN=ghp_xxx                :: classic token，勾 repo

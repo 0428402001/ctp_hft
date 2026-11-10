@@ -265,8 +265,10 @@ public:
 
     // Returns false if the writer was active and the copy had to be retried too
     // often (should not happen in practice).
-    // Copies account + positions under the seqlock. Instruments are looked up
-    // on demand (see findInstrument) so we never copy hundreds of kilobytes.
+    // Copies account + positions under the seqlock into a PRE-ALLOCATED array
+    // (kMaxPositions entries, ~56 KiB): no vector, no per-read allocation on
+    // the strategy hot path. Instruments are looked up on demand (see
+    // findInstrument) so we never copy hundreds of kilobytes.
     bool read(int maxRetries = 8) {
         for (int i = 0; i < maxRetries; ++i) {
             uint32_t s1 = block_->seq.load(std::memory_order_acquire);
@@ -276,7 +278,8 @@ public:
             if (n > kMaxPositions) n = kMaxPositions;
             instrCount_ = block_->instrCount.load(std::memory_order_relaxed);
             if (instrCount_ > kMaxInstruments) instrCount_ = kMaxInstruments;
-            positions_.assign(block_->positions, block_->positions + n);
+            std::memcpy(positions_, block_->positions, n * sizeof(PositionSnap));
+            posCount_ = n;
             std::atomic_thread_fence(std::memory_order_acquire);
             uint32_t s2 = block_->seq.load(std::memory_order_acquire);
             if (s1 == s2) return true;
@@ -287,13 +290,14 @@ public:
     SnapshotBlock* block() const { return block_; }
 
     const AccountSnap& account() const { return account_; }
-    uint32_t positionCount() const { return static_cast<uint32_t>(positions_.size()); }
+    uint32_t positionCount() const { return posCount_; }
     uint32_t instrumentCount() const { return instrCount_; }
-    const std::vector<PositionSnap>& positions() const { return positions_; }
+    const PositionSnap* positions() const { return positions_; }
 
     int32_t positionOf(const char* instrument, char direction) const {
         int32_t total = 0;
-        for (const auto& p : positions_) {
+        for (uint32_t i = 0; i < posCount_; ++i) {
+            const PositionSnap& p = positions_[i];
             if (std::strncmp(p.instrument, instrument, kInstrumentLen) == 0 &&
                 p.direction == direction) {
                 total += p.position;
@@ -328,7 +332,8 @@ private:
     SnapshotBlock* block_;
     AccountSnap account_{};
     uint32_t instrCount_ = 0;
-    std::vector<PositionSnap> positions_;
+    uint32_t posCount_ = 0;
+    PositionSnap positions_[kMaxPositions];  // pre-allocated, see read()
 };
 
 } // namespace hft

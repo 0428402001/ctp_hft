@@ -129,6 +129,11 @@ protected:
 
     int idleSleepUs() const override { return 1000; }
 
+    // Snapshot refresh runs every query interval_ms (default 3 s); waking
+    // once a second keeps it punctual while the exec-mirror / request
+    // doorbells handle the urgent traffic in between.
+    int64_t maxWaitNs() const override { return 1000000000ll; }
+
     // Wake instantly on exec-mirror items or explicit query requests; the
     // periodic refresh continues via the wait timeout.
     void collectWaitHandles(std::vector<void*>& handles) override {
@@ -333,14 +338,14 @@ private:
         case QueryType::Position: {
             SnapshotReader rd(channels().snapshot());
             if (!rd.read()) break;
-            const auto& pos = rd.positions();
-            for (size_t i = 0; i < pos.size(); ++i) {
+            const PositionSnap* pos = rd.positions();
+            for (size_t i = 0; i < rd.positionCount(); ++i) {
                 QueryResponse r;
                 std::memset(&r, 0, sizeof(r));
                 r.magic = kMagicQryRsp;
                 r.reqId = req.reqId;
                 r.type = req.type;
-                r.isLast = (i + 1 == pos.size()) ? 1 : 0;
+                r.isLast = (i + 1 == rd.positionCount()) ? 1 : 0;
                 r.position = pos[i];
                 r.rtnTimeNs = nowNs();
                 pushResponse(r);

@@ -34,6 +34,9 @@ protected:
 
     bool onStart(std::string& err) override {
         (void)err;
+        // The matcher report batch is reused every poll: reserve once so the
+        // sim hot path never grows a vector while matching.
+        reports_.reserve(32);
         if (simulation()) {
             matcher_.setLatencyMs(config().getInt("sim", "order_latency_ms", 0));
             matcher_.setFillPartial(config().getBool("sim", "partial_fills", true));
@@ -100,6 +103,13 @@ protected:
     }
 
     int idleSleepUs() const override { return 500; }
+
+    // Live: only the order-command doorbell matters; the 5 s stats print is
+    // the longest the loop may sleep. Sim: the local matcher must track the
+    // simulated market, so cap the block at 2 ms (sim mode only).
+    int64_t maxWaitNs() const override {
+        return simulation() ? 2000000ll : 5000000000ll;
+    }
 
     // Wake instantly when the strategy sends an order command.
     void collectWaitHandles(std::vector<void*>& handles) override {

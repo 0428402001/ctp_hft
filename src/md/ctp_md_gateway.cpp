@@ -7,6 +7,7 @@
 #ifdef HFT_ENABLE_CTP
 
 #include "hft/logger.h"
+#include "hft/thread_pin.h"
 #include "hft/time_util.h"
 
 #include <cstring>
@@ -28,7 +29,9 @@ std::string describe(CThostFtdcRspInfoField* pRspInfo) {
 
 } // namespace
 
-CtpMdGateway::CtpMdGateway(const Config& cfg) : cfg_(cfg) {}
+CtpMdGateway::CtpMdGateway(const Config& cfg) : cfg_(cfg) {
+    workerCpu_ = cfg.getInt("md", "ctp_cpu", -1);
+}
 
 CtpMdGateway::~CtpMdGateway() { stop(); }
 
@@ -181,6 +184,10 @@ TickMsg CtpMdGateway::convert(const CThostFtdcDepthMarketDataField& f) const {
 
 void CtpMdGateway::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField* pDepthMarketData) {
     if (!pDepthMarketData || !tickSink_) return;
+    // Pin the CTP worker thread once (first callback): it is the only writer
+    // of the tick ring, and keeping it on a fixed core avoids cross-core
+    // migration of the hot producer/consumer pair.
+    pinCurrentThreadOnce(workerCpu_, workerPin_);
     TickMsg t = convert(*pDepthMarketData);
     t.publishTimeNs = wallNowNs();
     tickSink_(t);

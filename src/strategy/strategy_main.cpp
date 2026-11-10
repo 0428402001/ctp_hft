@@ -30,13 +30,47 @@ namespace hft {
 // ---------------------------------------------------------------------------
 // Context implementation: translates strategy requests into ring buffer writes
 // and keeps the strategy side position book.
+//
+// Hot-path rule: NO dynamic allocation and NO std::string construction in
+// anything reachable from a tick. All lookup tables are fixed-size arrays of
+// 16 slots with a linear scan by instrument name - a strategy trades a
+// handful of instruments, so 2-3 strncmp()s beat a std::map node chase and
+// can never allocate.
 // ---------------------------------------------------------------------------
 class StrategyContextImpl : public StrategyContext {
 public:
+    // Max instruments the strategy can touch in one run (config lists 1-4).
+    static constexpr uint32_t kHotMax = 16;
+
+    struct TickSlot { char instrument[kInstrumentLen]; TickMsg tick; };
+    struct PosBook {
+        int net = 0;
+        double avg = 0.0;
+        double realized = 0.0;
+    };
+    struct PosSlot { char instrument[kInstrumentLen]; PosBook book; };
+    struct InstSlot { char instrument[kInstrumentLen]; InstrumentSnap snap; bool valid; };
+    struct BrokerSlot { char instrument[kInstrumentLen]; BrokerPosition bp; };
+
     StrategyContextImpl(CmdChannel* commands, ChannelEvent* commandsEvt, ControlBlock* control,
                         MarketSnapshotBlock* market, SnapshotBlock* snapshot)
         : commands_(commands), commandsEvt_(commandsEvt), control_(control), market_(market),
           reader_(snapshot) {}
+
+    // Linear find-or-insert over a fixed slot table. insert=false never
+    // grows the table (read-only lookups for unknown instruments).
+    template <typename Slot, uint32_t N>
+    static Slot* findSlot(Slot (&arr)[N], uint32_t& count, const char* instrument,
+                          bool insert) {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (std::strncmp(arr[i].instrument, instrument, kInstrumentLen) == 0) return &arr[i];
+        }
+        if (!insert || count >= N) return nullptr;
+        Slot& s = arr[count++];
+        s = Slot();  // value-init: zero the name, keep member initializers
+        copyStr(s.instrument, instrument);
+        return &s;
+    }
 
     uint32_t insert(const char* instrument, Dir direction, Offset offset, PriceType priceType,
                     double price, int volume, uint64_t tag) override {
@@ -118,8 +152,8 @@ public:
     }
 
     const TickMsg* lastTick(const char* instrument) const override {
-        auto it = ticks_.find(std::string(instrument));
-        return (it == ticks_.end()) ? nullptr : &it->second;
+        const TickSlot* s = findSlot(tickSlots_, tickSlotsN_, instrument, false);
+        return s ? &s->tick : nullptr;
     }
 
     double lastPrice(const char* instrument) const override {
@@ -144,30 +178,28 @@ public:
     }
 
     double priceTick(const char* instrument) const override {
-        auto it = instruments_.find(std::string(instrument));
-        if (it != instruments_.end() && it->second.priceTick > 0) return it->second.priceTick;
-        return fallbackTick_;
+        const InstrumentSnap* s = instrumentOf(instrument);
+        return (s && s->priceTick > 0) ? s->priceTick : fallbackTick_;
     }
 
     int volumeMultiple(const char* instrument) const override {
-        auto it = instruments_.find(std::string(instrument));
-        if (it != instruments_.end() && it->second.volumeMultiple > 0) return it->second.volumeMultiple;
-        return fallbackMultiple_;
+        const InstrumentSnap* s = instrumentOf(instrument);
+        return (s && s->volumeMultiple > 0) ? s->volumeMultiple : fallbackMultiple_;
     }
 
     int position(const char* instrument) const override {
-        auto it = positions_.find(std::string(instrument));
-        return (it == positions_.end()) ? 0 : it->second.net;
+        const PosSlot* s = findSlot(posSlots_, posSlotsN_, instrument, false);
+        return s ? s->book.net : 0;
     }
 
     double openPrice(const char* instrument) const override {
-        auto it = positions_.find(std::string(instrument));
-        return (it == positions_.end()) ? 0.0 : it->second.avg;
+        const PosSlot* s = findSlot(posSlots_, posSlotsN_, instrument, false);
+        return s ? s->book.avg : 0.0;
     }
 
     double realizedPnl(const char* instrument) const override {
-        auto it = positions_.find(std::string(instrument));
-        return (it == positions_.end()) ? 0.0 : it->second.realized;
+        const PosSlot* s = findSlot(posSlots_, posSlotsN_, instrument, false);
+        return s ? s->book.realized : 0.0;
     }
 
     bool snapshotReady() const override { return snapshotReady_; }
@@ -175,16 +207,17 @@ public:
     uint32_t snapshotQueryRound() const override { return snapshotRound_; }
 
     bool brokerPosition(const char* instrument, BrokerPosition& out) const override {
-        auto it = brokerPos_.find(std::string(instrument));
-        if (it == brokerPos_.end()) return false;
-        out = it->second;
+        const BrokerSlot* s = findSlot(brokerSlots_, brokerSlotsN_, instrument, false);
+        if (!s) return false;
+        out = s->bp;
         return true;
     }
 
     void adoptPosition(const char* instrument, int net, double price) override {
-        PosBook& p = positions_[std::string(instrument)];
-        p.net = net;
-        p.avg = price;
+        PosSlot* s = findSlot(posSlots_, posSlotsN_, instrument, true);
+        if (!s) return;  // table full (16 instruments) - logged upstream
+        s->book.net = net;
+        s->book.avg = price;
     }
 
     double available() const override { return available_; }
@@ -196,12 +229,16 @@ public:
     }
 
     // ---- bookkeeping driven by the process loop ----------------------------
-    void setTick(const TickMsg& t) { ticks_[std::string(t.instrument)] = t; }
+    void setTick(const TickMsg& t) {
+        TickSlot* s = findSlot(tickSlots_, tickSlotsN_, t.instrument, true);
+        if (s) s->tick = t;
+    }
 
     void applyExec(const ExecReport& r) {
         if (r.kind != ExecType::TradeRtn || r.tradeVolume <= 0) return;
-        const std::string key(r.instrument);
-        PosBook& p = positions_[key];
+        PosSlot* s = findSlot(posSlots_, posSlotsN_, r.instrument, true);
+        if (!s) return;
+        PosBook& p = s->book;
         const bool buy = (r.direction == static_cast<char>(Dir::Buy));
         const bool open = (r.offsetFlag == static_cast<char>(Offset::Open));
         const double px = r.tradePrice > 0 ? r.tradePrice : r.price;
@@ -244,13 +281,17 @@ public:
         // The per-record TodayPosition/YdPosition fields are the reliable way
         // to split the buckets: some counters return one aggregated row where
         // PositionDate says "today" but the row actually spans both days.
-        brokerPos_.clear();
-        for (const auto& p : reader_.positions()) {
+        brokerSlotsN_ = 0;
+        const PositionSnap* snaps = reader_.positions();
+        for (uint32_t si = 0; si < reader_.positionCount(); ++si) {
+            const PositionSnap& p = snaps[si];
             if (p.instrument[0] == '\0') continue;
             if (p.position <= 0) continue;
             HFT_LOGD("pos record %s dir=%c date=%c pos=%d today=%d yd=%d", p.instrument,
                      p.direction, p.positionDate, p.position, p.todayPosition, p.ydPosition);
-            BrokerPosition& b = brokerPos_[std::string(p.instrument)];
+            BrokerSlot* slot = findSlot(brokerSlots_, brokerSlotsN_, p.instrument, true);
+            if (!slot) break;  // table full; more instruments than a strategy can trade
+            BrokerPosition& b = slot->bp;
             int today = 0;
             int yd = 0;
             if (p.todayPosition >= 0 && p.ydPosition >= 0 &&
@@ -271,19 +312,21 @@ public:
                 b.shortYd += yd;
             }
         }
-        for (auto& kv : brokerPos_) {
-            kv.second.net = kv.second.longToday + kv.second.longYd - kv.second.shortToday -
-                            kv.second.shortYd;
+        for (uint32_t i = 0; i < brokerSlotsN_; ++i) {
+            BrokerSlot& slot = brokerSlots_[i];
+            slot.bp.net = slot.bp.longToday + slot.bp.longYd - slot.bp.shortToday -
+                          slot.bp.shortYd;
             HFT_LOGD("broker position %s: long %d(today)+%d(yd), short %d(today)+%d(yd) -> net=%d",
-                     kv.first.c_str(), kv.second.longToday, kv.second.longYd,
-                     kv.second.shortToday, kv.second.shortYd, kv.second.net);
+                     slot.instrument, slot.bp.longToday, slot.bp.longYd,
+                     slot.bp.shortToday, slot.bp.shortYd, slot.bp.net);
         }
 
-        const uint32_t n = blk->instrCount.load(std::memory_order_acquire);
-        for (uint32_t i = 0; i < n && i < kMaxInstruments; ++i) {
+        // Refresh the instrument metadata cache (tick size / multiplier) for
+        // the instruments the strategy actually looks up - the full 4000-row
+        // snapshot table is never copied, entries fill lazily in instrumentOf().
+        for (uint32_t i = 0; i < instSlotsN_; ++i) {
             InstrumentSnap s;
-            std::memcpy(&s, &blk->instruments[i], sizeof(s));
-            instruments_[std::string(s.instrument)] = s;
+            if (reader_.findInstrument(instSlots_[i].instrument, s)) instSlots_[i].snap = s;
         }
     }
 
@@ -293,12 +336,6 @@ public:
     }
 
 private:
-    struct PosBook {
-        int net = 0;
-        double avg = 0.0;
-        double realized = 0.0;
-    };
-
     const MarketTickSnap* marketSnap(const char* instrument) const {
         if (!market_) return nullptr;
         const uint32_t n = market_->count.load(std::memory_order_acquire);
@@ -310,16 +347,41 @@ private:
         return nullptr;
     }
 
+    // Instrument metadata, cached lazily: a lookup miss reads ONE record
+    // straight out of the shared snapshot under the seqlock (no bulk copy of
+    // the 4000-instrument table, no std::string, no map nodes). The cache is
+    // refreshed once a second by syncSnapshot().
+    const InstrumentSnap* instrumentOf(const char* instrument) const {
+        InstSlot* s = findSlot(instSlots_, instSlotsN_, instrument, false);
+        if (s && s->valid) return &s->snap;
+        if (!s) {
+            s = findSlot(instSlots_, instSlotsN_, instrument, true);
+            if (!s) return nullptr;  // cache full
+        }
+        SnapshotBlock* blk = reader_.block();
+        if (blk && reader_.findInstrument(instrument, s->snap)) {
+            s->valid = true;
+            return &s->snap;
+        }
+        return nullptr;
+    }
+
     CmdChannel* commands_;
     ChannelEvent* commandsEvt_ = nullptr;
     ControlBlock* control_;
     MarketSnapshotBlock* market_;
     SnapshotReader reader_;
 
-    std::map<std::string, TickMsg> ticks_;
-    std::map<std::string, PosBook> positions_;
-    std::map<std::string, InstrumentSnap> instruments_;
-    std::map<std::string, BrokerPosition> brokerPos_;
+    // Fixed hot tables (see class comment). Mutable: filled from the const
+    // accessor instrumentOf() and from const setTick() call paths.
+    mutable TickSlot tickSlots_[kHotMax]{};
+    mutable uint32_t tickSlotsN_ = 0;
+    mutable PosSlot posSlots_[kHotMax]{};
+    mutable uint32_t posSlotsN_ = 0;
+    mutable InstSlot instSlots_[kHotMax]{};
+    mutable uint32_t instSlotsN_ = 0;
+    mutable BrokerSlot brokerSlots_[kHotMax]{};
+    mutable uint32_t brokerSlotsN_ = 0;
     bool snapshotReady_ = false;
     uint32_t snapshotRound_ = 0;
     double available_ = 0.0;
@@ -432,6 +494,11 @@ protected:
     }
 
     int idleSleepUs() const override { return 200; }
+
+    // The process' own cadence is the 1 s strategy timer (onTimer + snapshot
+    // reconcile + stats). Between timer ticks the loop blocks on the tick /
+    // exec / query doorbells and burns no CPU.
+    int64_t maxWaitNs() const override { return 1000000000ll; }
 
     // Wake instantly when md publishes a tick, the trader returns an exec
     // report or the query process answers a request.

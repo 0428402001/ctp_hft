@@ -59,6 +59,10 @@ private:
     std::atomic<bool> loggedIn_{false};
     std::atomic<bool> connected_{false};
     std::atomic<int> requestId_{0};
+    // CTP worker-thread CPU pinning ([md] ctp_cpu, -1 = off): applied from
+    // inside the first callback, because the thread is created by the SDK.
+    std::atomic<int> workerPin_{0};
+    int workerCpu_ = -1;
     TickSink tickSink_;
     StatusSink statusSink_;
     std::string lastError_;

@@ -7,6 +7,7 @@
 #ifdef HFT_ENABLE_CTP
 
 #include "hft/logger.h"
+#include "hft/thread_pin.h"
 #include "hft/time_util.h"
 
 #include <cstring>
@@ -27,7 +28,9 @@ std::string describe(CThostFtdcRspInfoField* pRspInfo) {
 
 } // namespace
 
-CtpTraderGateway::CtpTraderGateway(const Config& cfg) : cfg_(cfg) {}
+CtpTraderGateway::CtpTraderGateway(const Config& cfg) : cfg_(cfg) {
+    workerCpu_ = cfg.getInt("trader", "ctp_cpu", -1);
+}
 
 CtpTraderGateway::~CtpTraderGateway() { stop(); }
 
@@ -428,6 +431,7 @@ void CtpTraderGateway::OnErrRtnOrderAction(CThostFtdcOrderActionField* pOrderAct
 
 void CtpTraderGateway::OnRtnOrder(CThostFtdcOrderField* pOrder) {
     if (!pOrder) return;
+    pinCurrentThreadOnce(workerCpu_, workerPin_);  // first callback pins the SDK thread
     if (isReplay(pOrder->FrontID, pOrder->SessionID, pOrder->OrderRef)) return;
     ExecReport r;
     std::memset(&r, 0, sizeof(r));

@@ -59,6 +59,32 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
     trendMinTicks_ = cfg.getInt("obi_voi", "trend_min_ticks", 1);
     consecStopPause_ = cfg.getInt("obi_voi", "consec_stop_pause", 0);
     pauseSeconds_ = cfg.getInt("obi_voi", "pause_seconds", 300);
+
+    // Session gate: "21:00-02:30" or a comma separated list. A negative window
+    // (to < from) means it crosses midnight, which is exactly what the night
+    // session of a commodity future does.
+    sessions_.clear();
+    const std::string sess = cfg.getString("obi_voi", "trade_sessions", "");
+    if (!sess.empty()) {
+        size_t pos = 0;
+        while (pos <= sess.size()) {
+            const size_t comma = sess.find(',', pos);
+            const std::string one =
+                sess.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            int h1 = 0, m1 = 0, h2 = 0, m2 = 0;
+            if (std::sscanf(one.c_str(), " %d:%d - %d:%d", &h1, &m1, &h2, &m2) == 4) {
+                sessions_.emplace_back(h1 * 3600 + m1 * 60, h2 * 3600 + m2 * 60);
+            } else {
+                HFT_LOGW("obi_voi: ignoring malformed trade_sessions entry '%s'", one.c_str());
+            }
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+        if (sessions_.empty()) {
+            HFT_LOGW("obi_voi: trade_sessions='%s' parsed to nothing, running 24 h",
+                     sess.c_str());
+        }
+    }
     tradeVolume_ = cfg.getInt("obi_voi", "trade_volume", 1);
     maxPosition_ = cfg.getInt("obi_voi", "max_position", 1);
     cooldownTicks_ = cfg.getInt("obi_voi", "cooldown_ticks", 5);
@@ -71,6 +97,11 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
         return false;
     }
     if (windowTicks_ < 2) windowTicks_ = 2;
+    if (windowTicks_ > static_cast<int>(State::kObiRing)) {
+        HFT_LOGW("obi_voi: window_ticks=%d exceeds the %u-slot OBI ring - clamped",
+                 windowTicks_, State::kObiRing);
+        windowTicks_ = static_cast<int>(State::kObiRing);
+    }
     if (obiThreshold_ <= 0.0 || obiThreshold_ >= 1.0) obiThreshold_ = 0.6;
     if (voiEmaTicks_ < 1) voiEmaTicks_ = 1;
     if (voiFlipThreshold_ < 0.0) voiFlipThreshold_ = 0.0;
@@ -105,20 +136,63 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
              trendWindowMs_, trendMinTicks_, tradeVolume_,
              maxPosition_, allowShort_ ? "yes" : "no",
              maxHoldSeconds_, escapeRetryMs_, consecStopPause_, pauseSeconds_);
+    if (!sessions_.empty()) {
+        std::string txt;
+        char one[32];
+        for (const auto& w : sessions_) {
+            std::snprintf(one, sizeof(one), "%s%02d:%02d-%02d:%02d", txt.empty() ? "" : ",",
+                          w.first / 3600, (w.first % 3600) / 60, w.second / 3600,
+                          (w.second % 3600) / 60);
+            txt += one;
+        }
+        HFT_LOGI("obi_voi: entry windows = %s (everything else: exits only)", txt.c_str());
+    }
     return true;
 }
 
 ObiVoiStrategy::State& ObiVoiStrategy::state(const char* instrument) {
-    auto it = states_.find(std::string(instrument));
-    if (it != states_.end()) return it->second;
-    State st;
-    states_[std::string(instrument)] = st;
-    return states_[std::string(instrument)];
+    if (State* s = findState(instrument)) return *s;
+    if (statesN_ < kMaxStates) {
+        StateEntry& e = states_[statesN_++];
+        e.st = State();  // default-init (keeps the '0' sentinels / armed flags)
+        copyStr(e.instrument, instrument);
+        return e.st;
+    }
+    HFT_LOGE("obi_voi: more than %u instruments - %s shares the overflow slot",
+             kMaxStates, instrument);
+    return overflowState_;
+}
+
+ObiVoiStrategy::State* ObiVoiStrategy::findState(const char* instrument) {
+    for (uint32_t i = 0; i < statesN_; ++i) {
+        if (std::strncmp(states_[i].instrument, instrument, kInstrumentLen) == 0) {
+            return &states_[i].st;
+        }
+    }
+    return nullptr;
 }
 
 double ObiVoiStrategy::roundToTick(double price, double tickSize) const {
     if (tickSize <= 0) return price;
     return std::floor(price / tickSize + 0.5) * tickSize;
+}
+
+// Computes the exit bracket from the entry price, ONCE per round trip.
+// After this the per-tick exit logic is a pair of plain comparisons - no
+// multiplication, no division, no roundToTick inside the tick callback.
+void ObiVoiStrategy::armBracket(State& st, double tickSize) {
+    st.tpTrigger = 0.0;
+    st.slTrigger = 0.0;
+    st.tpPrice = 0.0;
+    if (st.entryPrice <= 0 || tickSize <= 0) return;
+    const bool isLong = (st.entryDir == static_cast<char>(Dir::Buy));
+    st.tpTrigger = isLong ? st.entryPrice + profitTicks_ * tickSize
+                          : st.entryPrice - profitTicks_ * tickSize;
+    st.tpPrice = roundToTick(st.tpTrigger, tickSize);
+    if (stopLossTicks_ > 0) {
+        st.slTrigger = isLong ? st.entryPrice - stopLossTicks_ * tickSize
+                              : st.entryPrice + stopLossTicks_ * tickSize;
+    }
 }
 
 // Price-based stop loss. The ONLY justification for an IOC escape (paying
@@ -128,14 +202,11 @@ double ObiVoiStrategy::roundToTick(double price, double tickSize) const {
 // realized loss, not a mid-price illusion. VOI flips are noise and never
 // reach this function.
 bool ObiVoiStrategy::stopLossHit(const State& st, const TickMsg& tick, int net) const {
-    if (stopLossTicks_ <= 0 || net == 0 || st.entryPrice <= 0) return false;
-    const double tickSize = ctx_->priceTick(tick.instrument);
-    if (tickSize <= 0) return false;
+    if (st.slTrigger <= 0 || net == 0) return false;  // bracket armed at the fill
     const Dir closeDir = net > 0 ? Dir::Sell : Dir::Buy;
     const double touch = opponentPrice(tick, closeDir);
     if (touch <= 0) return false;
-    const double adverse = net > 0 ? st.entryPrice - touch : touch - st.entryPrice;
-    return adverse >= stopLossTicks_ * tickSize - 1e-9;
+    return net > 0 ? (touch <= st.slTrigger + 1e-9) : (touch >= st.slTrigger - 1e-9);
 }
 
 // True once the drift window actually spans enough time to mean anything.
@@ -143,14 +214,20 @@ bool ObiVoiStrategy::stopLossHit(const State& st, const TickMsg& tick, int net) 
 // overshot" and block every entry - a silent total trading stop.
 bool ObiVoiStrategy::midDriftReady(const State& st) const {
     if (trendWindowMs_ <= 0) return false;
-    if (st.midWin.size() < 8 || st.midTimesNs.size() != st.midWin.size()) return false;
-    const int64_t spanNs = st.midTimesNs.back() - st.midTimesNs.front();
+    if (st.midCount < 8) return false;
+    const int64_t spanNs = st.midCkAt(st.midCount - 1).ns - st.midCkAt(0).ns;
     return spanNs >= static_cast<int64_t>(trendWindowMs_) * INT64_C(400000);
 }
 
 double ObiVoiStrategy::midDriftTicks(const State& st, double tickSize) const {
     if (!midDriftReady(st) || tickSize <= 0) return 0.0;
-    return (st.midWin.back() - st.midWin.front()) / tickSize;
+    const State::MidCkpt& newest = st.midCkAt(st.midCount - 1);
+    const int64_t target = newest.ns - static_cast<int64_t>(trendWindowMs_) * INT64_C(1000000);
+    // First checkpoint at or inside the window edge - the same rule the old
+    // deque prune applied (front = first sample still within the window).
+    uint32_t idx = 0;
+    while (idx + 1 < st.midCount && st.midCkAt(idx).ns < target) ++idx;
+    return (newest.mid - st.midCkAt(idx).mid) / tickSize;
 }
 
 // The weak side of the book: our quote joins the side with less pressure.
@@ -187,30 +264,14 @@ void ObiVoiStrategy::updateIndicators(State& st, const TickMsg& tick) {
     // ---- OBI: normalized best level book imbalance -------------------------
     const double bv = static_cast<double>(tick.bidVolume1);
     const double av = static_cast<double>(tick.askVolume1);
-    if (bv + av > 0) {
-        st.obiWin.push_back((bv - av) / (bv + av));
-        if (st.obiWin.size() > static_cast<size_t>(windowTicks_)) st.obiWin.pop_front();
-    }
+    if (bv + av > 0) st.obiPush((bv - av) / (bv + av));
 
     // ---- short-horizon mid drift (trend filter input) -----------------------
-    // Kept in TIME, not in ticks: ag2612 ticks at 1-15/s depending on activity,
-    // so "20 ticks" is anywhere between 2 s and 20 s and the drift it measures
-    // is not comparable between a quiet and a busy stretch. Sampled from the
-    // touch (a stale last would smear it) and pruned to trend_window_ms.
+    // One checkpoint per second in a 32-slot ring (see State::midCk) - the
+    // right edge always tracks the latest tick, the window lookup happens at
+    // read time in midDriftTicks(). O(1) per tick, zero allocation.
     if (trendWindowMs_ > 0 && tick.bidPrice1 > 0 && tick.askPrice1 > 0) {
-        const int64_t ts = nowNs();
-        st.midTimesNs.push_back(ts);
-        st.midWin.push_back((tick.bidPrice1 + tick.askPrice1) * 0.5);
-        const int64_t cutoff = ts - static_cast<int64_t>(trendWindowMs_) * INT64_C(1000000);
-        while (!st.midTimesNs.empty() && st.midTimesNs.front() < cutoff) {
-            st.midTimesNs.pop_front();
-            st.midWin.pop_front();
-        }
-        // hard cap: if the clock stalls the prune above cannot fire
-        if (st.midWin.size() > 4000) {
-            st.midTimesNs.pop_front();
-            st.midWin.pop_front();
-        }
+        st.midUpdate(nowNs(), (tick.bidPrice1 + tick.askPrice1) * 0.5);
     }
 
     // ---- VOI: smoothed, normalized aggressor flow ---------------------------
@@ -247,7 +308,7 @@ void ObiVoiStrategy::updateIndicators(State& st, const TickMsg& tick) {
     HFT_LOGD("tickdat %s last=%.2f bid=%.2f ask=%.2f bv=%u av=%u obi=%+.2f voi=%+.2f",
              tick.instrument, tick.lastPrice, tick.bidPrice1, tick.askPrice1,
              tick.bidVolume1, tick.askVolume1,
-             st.obiWin.empty() ? 0.0 : st.obiWin.back(), st.voi);
+             st.obiCount ? st.obiBack() : 0.0, st.voi);
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +325,7 @@ void ObiVoiStrategy::onTick(const TickMsg& tick) {
     if (flattenOnStart_) startupGate(st, tick);
 
     // ---- 2) a working order: manage it, no new decisions --------------------
-    if (st.pending.active || !st.flattenLegs.empty()) {
+    if (st.pending.active || !st.flattenEmpty()) {
         manageWorkingOrder(st, tick);
         return;
     }
@@ -391,18 +452,26 @@ void ObiVoiStrategy::onTick(const TickMsg& tick) {
         } else if (makerMode_) {
             sendClosePassive(st, tick);
         } else if (st.entryPrice > 0) {
+            // Bracket prices come from armBracket (computed once at the fill);
+            // the lazy arm covers a fill that happened before the tick size
+            // was known. Per tick this branch is now: one lazy check + two
+            // comparisons.
             const double tickSize = ctx_->priceTick(tick.instrument);
+            if (st.tpTrigger <= 0 && tickSize > 0) armBracket(st, tickSize);
             const double touch = posSign > 0 ? tick.bidPrice1 : tick.askPrice1;
-            const double target =
-                posSign > 0 ? st.entryPrice + profitTicks_ * tickSize
-                            : st.entryPrice - profitTicks_ * tickSize;
-            if (tickSize > 0 && touch > 0 &&
-                posSign * (touch - st.entryPrice) >=
-                    profitTicks_ * tickSize - 1e-9) {
+            const double trigger = st.tpTrigger > 0
+                ? st.tpTrigger
+                : (tickSize > 0 ? (posSign > 0 ? st.entryPrice + profitTicks_ * tickSize
+                                              : st.entryPrice - profitTicks_ * tickSize)
+                                : 0.0);
+            if (trigger > 0 && touch > 0 &&
+                (posSign > 0 ? touch >= trigger - 1e-9 : touch <= trigger + 1e-9)) {
                 // Limit the IOC at the target, not at the touch: if the book
                 // runs past the target the fill still prints at the better bid
                 // (ask), and if it snaps back within the few hundred ms the
                 // order spends on the wire we are protected from a worse print.
+                const double target = st.tpPrice > 0 ? st.tpPrice
+                                                     : roundToTick(trigger, tickSize);
                 HFT_LOGI("TARGET %s: touch %.2f reached entry%+dt with no TP resting "
                          "-> take it now (IOC @ %.2f, never worse)",
                          tick.instrument, touch, profitTicks_, target);
@@ -455,14 +524,40 @@ void ObiVoiStrategy::reconcileBook(State& st, const TickMsg& tick) {
         st.entryPrice = ctx_->openPrice(tick.instrument);
         if (st.entryPrice <= 0) st.entryPrice = tick.lastPrice;
         st.entryDir = broker > 0 ? static_cast<char>(Dir::Buy) : static_cast<char>(Dir::Sell);
+        armBracket(st, ctx_->priceTick(tick.instrument));
     }
 }
 
 // The entry signal: extreme imbalance (condition A) + decaying flow that has
 // crossed the zero axis against the extreme (condition B).
+// ---------------------------------------------------------------------------
+//  Session gate: is this tick inside one of the configured entry windows?
+//  Uses the EXCHANGE timestamp carried by the tick, not the wall clock, so a
+//  replayed or delayed tick cannot open a position in the wrong session.
+//  Fails open on an unparseable timestamp: standing aside forever because of
+//  a malformed field would be worse than trading the full day.
+// ---------------------------------------------------------------------------
+bool ObiVoiStrategy::inSession(const TickMsg& tick) const {
+    if (sessions_.empty()) return true;
+    int h = 0, m = 0, s = 0;
+    if (std::sscanf(tick.updateTime, "%d:%d:%d", &h, &m, &s) != 3) return true;
+    const int t = h * 3600 + m * 60 + s;
+    for (const auto& w : sessions_) {
+        if (w.first <= w.second) {
+            if (t >= w.first && t < w.second) return true;
+        } else if (t >= w.first || t < w.second) {
+            return true;  // window crosses midnight (night session)
+        }
+    }
+    return false;
+}
+
 void ObiVoiStrategy::evaluate(State& st, const TickMsg& tick) {
-    if (st.obiWin.size() < static_cast<size_t>(windowTicks_)) return;  // warm-up
+    if (st.obiCount < static_cast<uint32_t>(windowTicks_)) return;  // warm-up
     if (st.cooldownTicks > 0) return;
+
+    // ---- session gate: only hunt for entries inside the profitable windows --
+    if (!inSession(tick)) return;
 
     // ---- streak guard: stand down while the market is trending against us ---
     if (st.pauseUntilNs) {
@@ -526,7 +621,8 @@ void ObiVoiStrategy::evaluate(State& st, const TickMsg& tick) {
 
     // ---- condition A: one side reached the extreme in the window ------------
     double maxO = -2.0, minO = 2.0;
-    for (double o : st.obiWin) {
+    for (uint32_t i = 0; i < st.obiCount; ++i) {
+        const double o = st.obiAt(i);
         if (o > maxO) maxO = o;
         if (o < minO) minO = o;
     }
@@ -564,7 +660,7 @@ void ObiVoiStrategy::evaluate(State& st, const TickMsg& tick) {
     // its quotes, not just pausing. Fewer, better signals.
     constexpr double kDecayMargin = 0.05;  // current obi must be inside
                                            // threshold - margin (receded)
-    const double obiNow = st.obiWin.back();
+    const double obiNow = st.obiBack();
     const bool decayedB = obiNow < obiThreshold_ - kDecayMargin;  // buy extreme receded
     const bool decayedS = obiNow > -(obiThreshold_ - kDecayMargin);  // sell extreme receded
     if (buyExtreme && st.voi < -voiEntryThreshold_ && decayedB &&
@@ -605,7 +701,7 @@ void ObiVoiStrategy::evaluate(State& st, const TickMsg& tick) {
 // Cancels are REQUESTED here; the pending slot only clears when the
 // final report arrives in onExec - "一切以回报为准".
 void ObiVoiStrategy::manageWorkingOrder(State& st, const TickMsg& tick) {
-    if (!st.flattenLegs.empty()) {
+    if (!st.flattenEmpty()) {
         pumpFlatten(st, tick);
         return;
     }
@@ -826,11 +922,13 @@ void ObiVoiStrategy::sendClosePassive(State& st, const TickMsg& tick) {
         // flip: bought the bid -> offer the ASK (weakSide of the sell), so a
         // buyer lifting the thin ask level fills us at +spread
         px = roundToTick(weakSidePrice(tick, dir), tickSize);
+    } else if (st.tpPrice > 0) {
+        px = st.tpPrice;  // precomputed at the entry fill (armBracket)
     } else if (st.entryPrice > 0) {
         const double target = (dir == Dir::Sell)
                                   ? st.entryPrice + profitTicks_ * tickSize
                                   : st.entryPrice - profitTicks_ * tickSize;
-        px = roundToTick(target, tickSize);
+        px = roundToTick(target, tickSize);  // tick size was unknown at the fill
     } else {
         px = roundToTick(weakSidePrice(tick, dir), tickSize);  // unknown entry
     }
@@ -1013,10 +1111,13 @@ void ObiVoiStrategy::resetRoundTrip(State& st) {
     st.closeReposts = 0;
     st.tpPosts = 0;
     st.ticksSinceTpPost = 0;
+    st.tpTrigger = 0.0;
+    st.slTrigger = 0.0;
+    st.tpPrice = 0.0;
     st.retryEntryDir = '0';
     st.retryEntryUntilNs = 0;
     st.awaitTradeUntilNs = 0;
-    st.flattenLegs.clear();
+    st.flattenClear();
     st.flattenFails = 0;
     st.flattenBackoffUntilNs = 0;
 }
@@ -1025,10 +1126,9 @@ void ObiVoiStrategy::resetRoundTrip(State& st) {
 //  onExec - everything that depends on an order outcome
 // ---------------------------------------------------------------------------
 void ObiVoiStrategy::onExec(const ExecReport& report) {
-    const std::string key(report.instrument);
-    auto it = states_.find(key);
-    if (it == states_.end()) return;
-    State& st = it->second;
+    State* sp = findState(report.instrument);
+    if (!sp) return;
+    State& st = *sp;
 
     // ---- a fill -------------------------------------------------------------
     if (report.kind == ExecType::TradeRtn) {
@@ -1051,6 +1151,7 @@ void ObiVoiStrategy::onExec(const ExecReport& report) {
                 st.entryPrice = px;
                 st.entryDir = report.direction;
                 st.openTimeNs = nowNs();
+                armBracket(st, ctx_->priceTick(report.instrument));  // TP/SL precomputed
                 st.pending.active = false;  // entry leg done (full or partial)
                 // Any entry remainder that is still resting gets pulled: the
                 // inventory cap forbids growing the position further.
@@ -1072,6 +1173,7 @@ void ObiVoiStrategy::onExec(const ExecReport& report) {
                 st.entryPrice = px;
                 st.entryDir = report.direction;
                 if (st.openTimeNs == 0) st.openTimeNs = nowNs();
+                armBracket(st, ctx_->priceTick(report.instrument));
             }
             // Fresh fill -> rest the take profit immediately (bracket order,
             // user spec 2026-11-05: TP = entry +/- profit_ticks, submitted the
@@ -1088,7 +1190,7 @@ void ObiVoiStrategy::onExec(const ExecReport& report) {
             // executing anyway, at a third of the order traffic.
             const int net = ctx_->position(report.instrument);
             const TickMsg* tick = ctx_->lastTick(report.instrument);
-            if (tpRepostMax_ > 0 && net != 0 && tick && st.flattenLegs.empty() &&
+            if (tpRepostMax_ > 0 && net != 0 && tick && st.flattenEmpty() &&
                 !st.pending.active) {
                 sendClosePassive(st, *tick);
             }
@@ -1404,7 +1506,7 @@ void ObiVoiStrategy::onExec(const ExecReport& report) {
 // ---------------------------------------------------------------------------
 void ObiVoiStrategy::startupGate(State& st, const TickMsg& tick) {
     if (st.tradingStarted || st.startupDone) return;
-    if (st.pending.active || !st.flattenLegs.empty()) return;
+    if (st.pending.active || !st.flattenEmpty()) return;
 
     const int net = ctx_->position(tick.instrument);
     if (net != 0) {
@@ -1473,17 +1575,17 @@ void ObiVoiStrategy::startFlatten(State& st, const char* instrument) {
     if (hasBroker) {
         net = bp.net;
         if (bp.longToday > 0)
-            st.flattenLegs.push_back({static_cast<char>(Dir::Sell), kCloseToday, bp.longToday});
+            st.flattenPush({static_cast<char>(Dir::Sell), kCloseToday, bp.longToday});
         if (bp.longYd > 0)
-            st.flattenLegs.push_back({static_cast<char>(Dir::Sell), kCloseYd, bp.longYd});
+            st.flattenPush({static_cast<char>(Dir::Sell), kCloseYd, bp.longYd});
         if (bp.shortToday > 0)
-            st.flattenLegs.push_back({static_cast<char>(Dir::Buy), kCloseToday, bp.shortToday});
+            st.flattenPush({static_cast<char>(Dir::Buy), kCloseToday, bp.shortToday});
         if (bp.shortYd > 0)
-            st.flattenLegs.push_back({static_cast<char>(Dir::Buy), kCloseYd, bp.shortYd});
+            st.flattenPush({static_cast<char>(Dir::Buy), kCloseYd, bp.shortYd});
     } else if (localNet != 0) {
         net = localNet;
         const char dir = localNet > 0 ? static_cast<char>(Dir::Sell) : static_cast<char>(Dir::Buy);
-        st.flattenLegs.push_back({dir, kCloseToday, localNet > 0 ? localNet : -localNet});
+        st.flattenPush({dir, kCloseToday, localNet > 0 ? localNet : -localNet});
     } else {
         return;
     }
@@ -1496,19 +1598,20 @@ void ObiVoiStrategy::startFlatten(State& st, const char* instrument) {
     ctx_->adoptPosition(instrument, net, ref);
     st.entryPrice = ref;
     st.entryDir = net > 0 ? static_cast<char>(Dir::Buy) : static_cast<char>(Dir::Sell);
+    armBracket(st, ctx_->priceTick(instrument));
     st.openTimeNs = nowNs();
     st.phase = Phase::Escaping;
     st.startupDone = false;
 
-    HFT_LOGW("STARTUP FLATTEN %s: %s net=%d -> %zu close leg(s) at the touch", instrument,
-             hasBroker ? "broker reports" : "book holds", net, st.flattenLegs.size());
+    HFT_LOGW("STARTUP FLATTEN %s: %s net=%d -> %u close leg(s) at the touch", instrument,
+             hasBroker ? "broker reports" : "book holds", net, st.flattenSize());
 }
 
 void ObiVoiStrategy::pumpFlatten(State& st, const TickMsg& tick) {
     if (st.pending.active) return;  // a flatten leg is on the wire
-    if (st.flattenLegs.empty()) return;
-    const CloseLeg leg = st.flattenLegs.front();
-    st.flattenLegs.pop_front();
+    if (st.flattenEmpty()) return;
+    const CloseLeg leg = st.flattenFront();
+    st.flattenPop();
     sendFlattenLeg(st, tick, leg);
 }
 
@@ -1520,19 +1623,19 @@ void ObiVoiStrategy::onTimer(int64_t nowNs) {
         for (const auto& inst : instruments_) {
             State& st = state(inst.c_str());
             if (st.tradingStarted || st.startupDone) continue;
-            if (st.pending.active || !st.flattenLegs.empty()) continue;
+            if (st.pending.active || !st.flattenEmpty()) continue;
             const TickMsg* tick = ctx_->lastTick(inst.c_str());
             if (!tick) continue;
             startupGate(st, *tick);
         }
     }
 
-    for (auto& kv : states_) {
-        State& st = kv.second;
+    for (uint32_t i = 0; i < statesN_; ++i) {
+        State& st = states_[i].st;
         if (st.tickCount == 0) continue;
-        const int net = ctx_->position(kv.first.c_str());
-        HFT_LOGD("%s voi=%+.2f obiWin=%zu net=%d phase=%s signals=%d orders=%d",
-                 kv.first.c_str(), st.voi, st.obiWin.size(), net, phaseName(st.phase),
+        const int net = ctx_->position(states_[i].instrument);
+        HFT_LOGD("%s voi=%+.2f obiWin=%u net=%d phase=%s signals=%d orders=%d",
+                 states_[i].instrument, st.voi, st.obiCount, net, phaseName(st.phase),
                  st.signalCount, st.orderCount);
         (void)nowNs;
     }
@@ -1540,18 +1643,18 @@ void ObiVoiStrategy::onTimer(int64_t nowNs) {
 
 void ObiVoiStrategy::onStop() {
     if (!closeOnStop_ || !ctx_) return;
-    for (auto& kv : states_) {
-        const int net = ctx_->position(kv.first.c_str());
+    for (uint32_t i = 0; i < statesN_; ++i) {
+        State& st = states_[i].st;
+        const int net = ctx_->position(states_[i].instrument);
         if (net == 0) continue;
-        const TickMsg* tick = ctx_->lastTick(kv.first.c_str());
+        const TickMsg* tick = ctx_->lastTick(states_[i].instrument);
         if (!tick) continue;
-        HFT_LOGI("shutdown: flatten %s net=%d at the touch", kv.first.c_str(), net);
-        State& st = kv.second;
+        HFT_LOGI("shutdown: flatten %s net=%d at the touch", states_[i].instrument, net);
         const Dir dir = net > 0 ? Dir::Sell : Dir::Buy;
         const int volume = net > 0 ? net : -net;
         const double px = roundToTick(opponentPrice(*tick, dir),
-                                      ctx_->priceTick(kv.first.c_str()));
-        const uint32_t cmdId = ctx_->insert(kv.first.c_str(), dir, Offset::CloseToday,
+                                      ctx_->priceTick(states_[i].instrument));
+        const uint32_t cmdId = ctx_->insert(states_[i].instrument, dir, Offset::CloseToday,
                                             PriceType::Limit, px, volume,
                                             static_cast<uint64_t>(st.tickCount));
         if (cmdId != 0) st.orderCount++;

@@ -116,9 +116,13 @@ private:
     alignas(HFT_CACHELINE) std::atomic<uint64_t> readIndex_{0};
     alignas(HFT_CACHELINE) std::atomic<uint64_t> popped_{0};
 
-    // The payload itself, cache-line aligned so that consecutive slot writes
-    // from the producer do not thrash the consumer's index line.
-    alignas(HFT_CACHELINE) T slots_[Capacity];
+    // The payload itself, page aligned: the header above is padded out to a
+    // full 4 KiB, so slot 0 lands exactly on a page boundary in the mapped
+    // file view (MapViewOfFile bases are 64 KiB aligned). Combined with the
+    // 256/512 B slot sizes in protocol.h a linear walk of the ring touches a
+    // new page only every 8-16 slots instead of straddling two pages per
+    // slot - one TLB entry per page, no split-slot double faults.
+    alignas(4096) T slots_[Capacity];
 };
 
 #endif // HFT_RING_QUEUE_H
