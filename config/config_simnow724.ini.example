@@ -86,24 +86,31 @@ name = obi_voi
 ;         once per tp_repost_interval_ticks, up to tp_repost_max times
 ;  inventory: net capped at max_position, at the cap closes only
 ; ---------------------------------------------------------------------------
-window_ticks       = 16      ; tightened from 20: the trend filter below now
-                              ;   supplies the quality, so the window can react
-                              ;   faster and fire more often (user asked for
-                              ;   more entries, 2026-11-06)
-obi_threshold      = 0.92    ; 0.95 -> 0.92: the overshoot filter below removes
-                              ;   64 % of the signals, so the threshold is relaxed
-                              ;   a little to keep the trade count up. Offline
-                              ;   replay on 2026-11-06 ticks: 0.95 -> 26 candidates,
-                              ;   0.90 -> 68 (too weak), 0.92 -> ~46
+
+; ---------------------------------------------------------------------------
+;  Entry windows. Backtest on 131 783 recorded ticks (2026-11-05/06, incl. cost):
+;    night 21:00-02:30  68 trips  +281 tick  +4.13/trip  62 % win
+;    day   09:00-15:00  28 trips  -137 tick  -4.89/trip  22 % win
+;  The fade only pays in the night session; the day session is where the
+;  trend days live. Outside the windows nothing is opened (exits still run).
+trade_sessions     = 21:00-02:30
+window_ticks       = 10      ; 16 -> 10: the stall filter below now covers the
+                              ;   short horizon, so the OBI window can react faster
+obi_threshold      = 0.90    ; 0.92 -> 0.90 together with window 16 -> 10: the
+                              ;   measured set that keeps ~66-68 night entries
 voi_ema_ticks      = 5
 voi_flip_threshold = 0.35
 voi_entry_threshold = 0.1    ; |VOI| minimum that confirms the reversal (0 = sign only)
 entry_timeout_ticks = 4
 entry_taker        = 1      ; 7x24 front cancels resting quotes in 100-500ms: cross + IOC,
                             ; so a signal always lands (costs 0-1 tick of slippage)
-profit_ticks       = 8      ; TP limit rests at entry +/- 8 ticks (ag: ~2 ticks of fee must sit inside)
+profit_ticks       = 16     ; 8 -> 16. At 8 the winners printed +7..+9 while the
+                            ;   stops printed -6..-9 (2026-11-10 live: 31 trips,
+                            ;   32 % win, -51 tick). 16/8 gives R:R 2.0, which is
+                            ;   what a 55-62 % win rate needs to be positive.
 close_timeout_ticks = 6
-stop_loss_ticks    = 6      ; price stop: touch 6 ticks against entry -> cancel TP, IOC stop
+stop_loss_ticks    = 8      ; 6 -> 8: 6 ticks is inside the noise band of ag; every
+                            ;   <=10 s stop-out in the 11-10 session was 5-6 ticks.
 stop_slippage_ticks = 2     ; a limit IOC prints at the best level that has volume, so the
                             ;   cross width costs nothing there - it only decides whether the
                             ;   order still reaches a level with bids/offers. 1 tick missed
@@ -121,8 +128,8 @@ tp_repost_max      = 0      ; 0 = never rest a TP. SimNow cancels every
                               ;   bracket never actually rested - the exit was
                               ;   always the price-trigger IOC anyway, plus up to
                               ;   8 dead orders per round trip at the counter
-max_spread_ticks   = 2      ; skip entries while ask1-bid1 > 2 ticks (each extra
-                            ;   tick of spread lengthens the distance to the TP)
+max_spread_ticks   = 1      ; 2 -> 1: the target is measured from the FILL, so every
+                              ;   extra tick of spread has to be travelled twice
 trend_window_ms    = 30000  ; overshoot window (30 s of mid). Measured over 69
                               ;   real round trips (11-05 724 + 11-06 day, phantom
                               ;   trips removed): entering AGAINST a 0-5 tick drift
@@ -132,6 +139,20 @@ trend_window_ms    = 30000  ; overshoot window (30 s of mid). Measured over 69
 trend_min_ticks    = 1      ; how far the price must have ALREADY run against the
                               ;   entry over that window. 1 = a single tick is
                               ;   enough to prove the move happened
+; The stall filter: the touch must have come `entry_stall_ticks` off the extreme
+; printed in the last `stall_window_ticks` ticks. Drift (30 s) cannot tell a
+; 20 s old overshoot from one that started 2 s ago; this can. 2026-11-10 live:
+; every trip that stopped out within 10 s (8 trips, -40 tick) entered while the
+; impulse was still extending. Backtest: night +4.13 -> +4.53 tick/trip.
+entry_stall_ticks  = 2
+stall_window_ticks = 6
+; Once the trip has printed breakeven_ticks of profit the stop moves to the
+; entry price and never moves back. 13 of 31 trips on 11-10 reached >= +7 tick
+; and 5 of them still closed at <= -6.
+breakeven_ticks    = 8
+; No new entries in the last entry_blackout_sec of a window: 11-10 bought at
+; 14:59:15 (45 s before the SHFE close) and could not close it any more.
+entry_blackout_sec = 300
 consec_stop_pause  = 3      ; after 3 losing round trips in a row, stop looking for
                             ;   entries for pause_seconds. A fade bleeds in a trend;
                             ;   2026-11-06 11:02-11:04 three shorts stopped -5/-6/-6

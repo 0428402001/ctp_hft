@@ -17,6 +17,23 @@
 
 namespace hft {
 
+namespace {
+// A counter rejection that says "the market is not taking orders now" is NOT
+// retryable: rotating the offset flag, crossing wider or re-sending 800 ms
+// later all come back with the same answer. Recognise it so the state machine
+// stops churning and carries the position to the next session instead.
+bool isClosedMarketRejection(const char* msg) {
+    if (!msg || !*msg) return false;
+    static const char* kNeedles[] = {"禁止此项操作", "非交易时间", "不在交易",
+                                     "已收盘", "市场已关闭", "not in trading",
+                                     "market closed"};
+    for (const char* n : kNeedles) {
+        if (std::strstr(msg, n) != nullptr) return true;
+    }
+    return false;
+}
+}  // namespace
+
 const char* ObiVoiStrategy::phaseName(Phase p) {
     switch (p) {
         case Phase::Idle: return "idle";
@@ -57,6 +74,10 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
     maxSpreadTicks_ = cfg.getInt("obi_voi", "max_spread_ticks", 0);
     trendWindowMs_ = cfg.getInt("obi_voi", "trend_window_ms", 0);
     trendMinTicks_ = cfg.getInt("obi_voi", "trend_min_ticks", 1);
+    entryStallTicks_ = cfg.getInt("obi_voi", "entry_stall_ticks", 2);
+    stallWindowTicks_ = cfg.getInt("obi_voi", "stall_window_ticks", 6);
+    breakevenTicks_ = cfg.getInt("obi_voi", "breakeven_ticks", 8);
+    entryBlackoutSec_ = cfg.getInt("obi_voi", "entry_blackout_sec", 300);
     consecStopPause_ = cfg.getInt("obi_voi", "consec_stop_pause", 0);
     pauseSeconds_ = cfg.getInt("obi_voi", "pause_seconds", 300);
 
@@ -117,6 +138,13 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
     if (maxSpreadTicks_ < 0) maxSpreadTicks_ = 0;
     if (trendWindowMs_ < 0) trendWindowMs_ = 0;
     if (trendMinTicks_ < 0) trendMinTicks_ = 0;
+    if (entryStallTicks_ < 0) entryStallTicks_ = 0;
+    if (stallWindowTicks_ < 1) stallWindowTicks_ = 1;
+    if (stallWindowTicks_ > static_cast<int>(State::kTouchRing)) {
+        stallWindowTicks_ = static_cast<int>(State::kTouchRing);
+    }
+    if (breakevenTicks_ < 0) breakevenTicks_ = 0;
+    if (entryBlackoutSec_ < 0) entryBlackoutSec_ = 0;
     if (consecStopPause_ < 0) consecStopPause_ = 0;
     if (pauseSeconds_ < 0) pauseSeconds_ = 0;
     if (tradeVolume_ < 1 || maxPosition_ < 1) {
@@ -127,7 +155,7 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
     HFT_LOGI("obi_voi: mode=%s window=%d obiTh=%.2f voiEma=%d voiFlip=%.2f voiEntry=%.2f | entryTimeout=%dt "
              "entrySlip=%dt taker=%s profit=%dt closeTimeout=%dt stopLoss=%dt stopSlip=%dt maxHold=%dt "
              "tpRepost=%d/%dt maxSpread=%dt trend=%dms/%dt vol=%d maxPos=%d short=%s | maxHoldSec=%d "
-             "escapeRetry=%dms consecStop=%d/%ds",
+             "escapeRetry=%dms consecStop=%d/%ds stall=%dt/%dw be=%dt blackout=%ds",
              makerMode_ ? "maker" : "fade", windowTicks_, obiThreshold_, voiEmaTicks_,
              voiFlipThreshold_, voiEntryThreshold_, entryTimeoutTicks_, entrySlippageTicks_,
              entryTaker_ ? "ioc" : "gfd",
@@ -135,7 +163,8 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
              maxHoldTicks_, tpRepostMax_, tpRepostIntervalTicks_, maxSpreadTicks_,
              trendWindowMs_, trendMinTicks_, tradeVolume_,
              maxPosition_, allowShort_ ? "yes" : "no",
-             maxHoldSeconds_, escapeRetryMs_, consecStopPause_, pauseSeconds_);
+             maxHoldSeconds_, escapeRetryMs_, consecStopPause_, pauseSeconds_,
+             entryStallTicks_, stallWindowTicks_, breakevenTicks_, entryBlackoutSec_);
     if (!sessions_.empty()) {
         std::string txt;
         char one[32];
@@ -184,6 +213,7 @@ void ObiVoiStrategy::armBracket(State& st, double tickSize) {
     st.tpTrigger = 0.0;
     st.slTrigger = 0.0;
     st.tpPrice = 0.0;
+    st.beArmed = false;
     if (st.entryPrice <= 0 || tickSize <= 0) return;
     const bool isLong = (st.entryDir == static_cast<char>(Dir::Buy));
     st.tpTrigger = isLong ? st.entryPrice + profitTicks_ * tickSize
@@ -265,6 +295,11 @@ void ObiVoiStrategy::updateIndicators(State& st, const TickMsg& tick) {
     const double bv = static_cast<double>(tick.bidVolume1);
     const double av = static_cast<double>(tick.askVolume1);
     if (bv + av > 0) st.obiPush((bv - av) / (bv + av));
+
+    // ---- touch history for the stall filter --------------------------------
+    if (tick.bidPrice1 > 0 && tick.askPrice1 > 0) {
+        st.touchPush(tick.bidPrice1, tick.askPrice1);
+    }
 
     // ---- short-horizon mid drift (trend filter input) -----------------------
     // One checkpoint per second in a 32-slot ring (see State::midCk) - the
@@ -439,6 +474,26 @@ void ObiVoiStrategy::onTick(const TickMsg& tick) {
         const int posSign = net > 0 ? 1 : -1;
         if (st.voi * posSign < -voiFlipThreshold_) ++st.adverseTicks;
         else st.adverseTicks = 0;
+        // ---- breakeven ratchet ---------------------------------------------
+        // Once the trip has printed breakeven_ticks of profit, the stop moves
+        // to the entry price (it never moves back). On 2026-11-10, 13 of 31
+        // round trips reached >= +7 ticks and 5 still closed at <= -6: the
+        // bracket kept waiting for +8 while the market gave it all back.
+        // The exit on the ratcheted stop still pays stop slippage, so the
+        // worst case after arming is roughly -1 tick minus fees, not -8.
+        if (breakevenTicks_ > 0 && !st.beArmed && st.entryPrice > 0 && st.slTrigger > 0) {
+            const double ts = ctx_->priceTick(tick.instrument);
+            const double touchNow = posSign > 0 ? tick.bidPrice1 : tick.askPrice1;
+            if (ts > 0 && touchNow > 0) {
+                const double fav = (touchNow - st.entryPrice) * posSign / ts;
+                if (fav >= breakevenTicks_ - 1e-9) {
+                    st.beArmed = true;
+                    st.slTrigger = st.entryPrice;
+                    HFT_LOGI("BREAKEVEN %s: %+.0ft reached -> stop moves to entry %.2f",
+                             tick.instrument, fav, st.entryPrice);
+                }
+            }
+        }
         const bool stopped = stopLossHit(st, tick, net);
         const bool expired = (maxHoldTicks_ > 0 && st.holdTicks >= maxHoldTicks_);
         if (stopped || expired || holdExpired) {
@@ -552,12 +607,37 @@ bool ObiVoiStrategy::inSession(const TickMsg& tick) const {
     return false;
 }
 
+// A position opened seconds before the close cannot be managed: on 2026-11-10
+// the run bought ag2702 at 14:59:15 and the close order at 15:21:04 was refused
+// by SHFE ("当前状态禁止此项操作"). No new entries in the last blackout of a
+// window; exits are unaffected (a position must always be closable).
+bool ObiVoiStrategy::nearSessionEnd(const TickMsg& tick) const {
+    if (sessions_.empty() || entryBlackoutSec_ <= 0) return false;
+    int h = 0, m = 0, s = 0;
+    if (std::sscanf(tick.updateTime, "%d:%d:%d", &h, &m, &s) != 3) return false;
+    const int t = h * 3600 + m * 60 + s;
+    const int day = 24 * 3600;
+    for (const auto& w : sessions_) {
+        const bool inWin = (w.first <= w.second)
+                               ? (t >= w.first && t < w.second)
+                               : (t >= w.first || t < w.second);
+        if (!inWin) continue;
+        int until = w.second - t;
+        if (until < 0) until += day;          // window ends after midnight
+        if (until > 0 && until <= entryBlackoutSec_) return true;
+    }
+    return false;
+}
+
 void ObiVoiStrategy::evaluate(State& st, const TickMsg& tick) {
     if (st.obiCount < static_cast<uint32_t>(windowTicks_)) return;  // warm-up
     if (st.cooldownTicks > 0) return;
 
     // ---- session gate: only hunt for entries inside the profitable windows --
     if (!inSession(tick)) return;
+    // ... and not in the last minutes of one: a position opened there cannot
+    // be closed before the exchange shuts (2026-11-10 14:59:15 entry).
+    if (nearSessionEnd(tick)) return;
 
     // ---- streak guard: stand down while the market is trending against us ---
     if (st.pauseUntilNs) {
@@ -652,6 +732,32 @@ void ObiVoiStrategy::evaluate(State& st, const TickMsg& tick) {
     const bool driftUpOk = (!trendActive || drift >= trendMinTicks_ - 1e-9);
     const bool driftDownOk = (!trendActive || drift <= -trendMinTicks_ + 1e-9);
 
+    // ---- condition E: the impulse must have STOPPED printing extremes ------
+    // Drift is a 30 s average: it cannot tell an overshoot that is 20 s old
+    // (the good fade) from one that started 2 s ago (the one that runs us
+    // over). Require the touch to have come entry_stall_ticks off the extreme
+    // of the last stall_window_ticks ticks. Every <=10 s stop-out in the
+    // 2026-11-10 day session (8 trips, -40 ticks) fails this test.
+    if (entryStallTicks_ > 0 && tick.bidPrice1 > 0 && tick.askPrice1 > 0) {
+        const double tsz = ctx_->priceTick(tick.instrument);
+        if (tsz > 0) {
+            const double need = entryStallTicks_ * tsz;
+            const double k = static_cast<uint32_t>(stallWindowTicks_);
+            const double lowOff = tick.bidPrice1 - st.bidMin(static_cast<uint32_t>(k));
+            const double highOff = st.askMax(static_cast<uint32_t>(k)) - tick.askPrice1;
+            const bool buyStalled = (lowOff >= need - 1e-9);   // came off the low
+            const bool sellStalled = (highOff >= need - 1e-9); // came off the high
+            if (!buyStalled && !sellStalled) {
+                HFT_LOGD("SKIP %s: impulse still extending (off low %.0ft, off high %.0ft, "
+                         "need %dt) - not a fade yet", tick.instrument,
+                         lowOff / tsz, highOff / tsz, entryStallTicks_);
+                return;
+            }
+            if (buyExtreme && !sellStalled) return;
+            if (sellExtreme && !buyStalled) return;
+        }
+    }
+
     // ---- condition B: the flow behind the extreme just crossed zero --------
     // Tightened (2026-11-05 backtest, 21.5k ticks): the sign-only flip fired
     // on chop noise. Now require (1) a minimum reversal magnitude
@@ -701,6 +807,8 @@ void ObiVoiStrategy::evaluate(State& st, const TickMsg& tick) {
 // Cancels are REQUESTED here; the pending slot only clears when the
 // final report arrives in onExec - "一切以回报为准".
 void ObiVoiStrategy::manageWorkingOrder(State& st, const TickMsg& tick) {
+    // Nothing can be sent while the counter says the session is closed.
+    if (st.marketClosedUntilNs != 0 && nowNs() < st.marketClosedUntilNs) return;
     if (!st.flattenEmpty()) {
         pumpFlatten(st, tick);
         return;
@@ -982,6 +1090,12 @@ void ObiVoiStrategy::sendCloseIoc(State& st, const TickMsg& tick, int extraSlipT
                                   char offsetFlag, double limitPrice) {
     const int net = ctx_->position(tick.instrument);
     if (net == 0) return;
+    // The counter told us the session is closed: every order sent before the
+    // next open is refused and only burns the rate budget (2026-11-10, the
+    // 15:21:04 close after the 15:00 SHFE close). Hold the position and retry
+    // once the deadline expires - by then the market is usually open again
+    // and the escape flattens it.
+    if (st.marketClosedUntilNs != 0 && nowNs() < st.marketClosedUntilNs) return;
     const Dir dir = net > 0 ? Dir::Sell : Dir::Buy;
     const int volume = net > 0 ? net : -net;
 
@@ -1114,6 +1228,7 @@ void ObiVoiStrategy::resetRoundTrip(State& st) {
     st.tpTrigger = 0.0;
     st.slTrigger = 0.0;
     st.tpPrice = 0.0;
+    st.beArmed = false;
     st.retryEntryDir = '0';
     st.retryEntryUntilNs = 0;
     st.awaitTradeUntilNs = 0;
@@ -1242,6 +1357,24 @@ void ObiVoiStrategy::onExec(const ExecReport& report) {
     // ---- errors ---------------------------------------------------------------
     if (report.errorId != 0) {
         HFT_LOGW("ORDER ERROR %s (%d) %s", report.instrument, report.errorId, report.errorMsg);
+        // Session closed: stand down instead of re-sending. See the header of
+        // isClosedMarketRejection - the retry paths below would each fire once
+        // and be refused again.
+        if (isClosedMarketRejection(report.errorMsg)) {
+            const int64_t until = nowNs() + INT64_C(600000000000);  // 10 min
+            st.marketClosedUntilNs = until;
+            st.pauseUntilNs = until;
+            if (st.pending.active) {
+                st.pending.active = false;
+                st.pending.cancelSent = false;
+                st.pending.firstCancelNs = 0;
+            }
+            HFT_LOGE("%s: order refused because the session is closed (%s) -> "
+                     "no orders for 10 min; net=%d is carried until the market "
+                     "reopens (a stop it should have taken is logged above)",
+                     report.instrument, report.errorMsg, ctx_->position(report.instrument));
+            return;
+        }
         // A cancel that the counter rejects ("order not found" and friends)
         // means the order is already terminal and no further report will come.
         // Waiting forever would wedge the slot; release it and let the tick

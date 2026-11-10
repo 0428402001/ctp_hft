@@ -23,6 +23,9 @@ import re
 
 LOG = "log/strategy.log"
 INSTR = "ag2612"
+STALL = 0        # ticks the price must have come off the recent extreme
+STALL_WIN = 6    # look-back for that extreme
+BE = 0           # breakeven stop after N ticks of profit
 
 TICKDAT = re.compile(
     rb"\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*tickdat " + INSTR.encode() + rb" "
@@ -89,10 +92,26 @@ def entries_of(ts, bid, ask, obi, voi, drift, obi_th, voi_th, trend, max_spread)
             continue
         if SESSION and not (SESSION[0] <= sec_of_day(ts[i]) < SESSION[1]):
             continue
+        side = 0
         if obi[i] <= -obi_th and voi[i] >= voi_th and drift[i] <= -trend:
-            out.append((i, 1))
+            side = 1
         elif obi[i] >= obi_th and voi[i] <= -voi_th and drift[i] >= trend:
-            out.append((i, -1))
+            side = -1
+        if not side:
+            continue
+        # --- stall filter: price must have come OFF the extreme already -------
+        # Fading a book imbalance is only an edge once the impulse has stopped
+        # printing new extremes; entering while it is still extending is what
+        # produced every <=10 s stop-out in the 2026-11-10 day session.
+        if STALL > 0:
+            lo = max(0, i - STALL_WIN + 1)
+            if side > 0:
+                if bid[i] - min(bid[lo:i + 1]) < STALL:
+                    continue
+            else:
+                if max(ask[lo:i + 1]) - ask[i] < STALL:
+                    continue
+        out.append((i, side))
     return out
 
 
@@ -109,6 +128,7 @@ def simulate(entries, bid, ask, tp, sl, hold, a):
         entry = (ask[e] + a.slip) if side > 0 else (bid[e] - a.slip)
         tp_px = entry + side * tp
         sl_px = entry - side * sl
+        stop_px = sl_px
         j = e + 1
         end = min(N, e + 1 + hold)
         exit_px = None
@@ -117,15 +137,23 @@ def simulate(entries, bid, ask, tp, sl, hold, a):
                 if bid[j] >= tp_px:
                     exit_px, wins = tp_px, wins + 1
                     break
-                if bid[j] <= sl_px:
-                    exit_px, losses = bid[j] - a.sl_slip, losses + 1
+                # breakeven: once BE ticks of profit printed, the stop moves to
+                # the entry price and the trip can no longer lose (minus fees).
+                if BE > 0 and bid[j] - entry >= BE:
+                    stop_px = max(stop_px, entry)
+                if bid[j] <= stop_px:
+                    exit_px = bid[j] - (a.sl_slip if stop_px != entry else 0.0)
+                    losses += 1
                     break
             else:
                 if ask[j] <= tp_px:
                     exit_px, wins = tp_px, wins + 1
                     break
-                if ask[j] >= sl_px:
-                    exit_px, losses = ask[j] + a.sl_slip, losses + 1
+                if BE > 0 and entry - ask[j] >= BE:
+                    stop_px = min(stop_px, entry)
+                if ask[j] >= stop_px:
+                    exit_px = ask[j] + (a.sl_slip if stop_px != entry else 0.0)
+                    losses += 1
                     break
             j += 1
         if exit_px is None:
@@ -157,9 +185,17 @@ def main():
     ap.add_argument("--eval", default="",
                     help="evaluate one config: obi,voi,trend,tp,sl,hold "
                          "(e.g. 0.92,0.1,1,8,6,120) instead of the grid")
+    ap.add_argument("--stall", type=int, default=0,
+                    help="entry filter: price must have come >= N ticks off the "
+                         "recent extreme (0 = off)")
+    ap.add_argument("--stall-win", type=int, default=6,
+                    help="look-back in ticks for the stall filter's extreme")
+    ap.add_argument("--be", type=int, default=0,
+                    help="breakeven stop after N ticks of profit (0 = off)")
     a = ap.parse_args()
 
-    global SESSION
+    global SESSION, STALL, STALL_WIN, BE
+    STALL, STALL_WIN, BE = a.stall, a.stall_win, a.be
     if a.session == "night":
         SESSION = (21 * 3600, 26.5 * 3600)
     elif a.session == "day":

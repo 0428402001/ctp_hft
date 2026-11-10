@@ -43,3 +43,7 @@ __pycache__/
 # ---------------------------------------------------------------
 third_party/fmtlog/.git_vendored/
 nul
+
+# local archives
+*.rar
+*.7z

@@ -76,7 +76,19 @@ name = obi_voi
 [obi_voi]
 ; ---------------------------------------------------------------------------
 ;  L1 order book imbalance fade strategy + BRACKET exits (user spec 2026-11-05)
-;  entry: |OBI| > obi_threshold inside window_ticks AND VOI reversed with at
+;  entry: |OBI| > obi_threshold inside ; ---------------------------------------------------------------------------
+;  Entry windows (same evidence as the 7x24 config: night +4.13 tick/trip,
+;  day -4.89 tick/trip over 131 783 recorded ticks). Remove this line only if a
+;  day-session backtest ever turns positive.
+trade_sessions     = 21:00-02:30
+; Stall filter: price must have come off the recent extreme by N ticks.
+entry_stall_ticks  = 2
+stall_window_ticks = 6
+; Breakeven ratchet: stop moves to entry after N ticks of profit.
+breakeven_ticks    = 8
+; No new entries in the last N seconds of a window.
+entry_blackout_sec = 300
+window_ticks AND VOI reversed with at
 ;         least voi_entry_threshold magnitude AND the current OBI has receded
 ;         from the extreme (decay confirmation) -> fade on the WEAK side
 ;  exit : the moment the entry fills a take-profit LIMIT rests at
@@ -92,7 +104,7 @@ window_ticks       = 16      ; tightened from 20: the trend filter below now
                               ;   supplies the quality, so the window can react
                               ;   faster and fire more often (user asked for
                               ;   more entries, 2026-11-06)
-obi_threshold      = 0.92    ; 0.95 -> 0.92: the overshoot filter below removes
+obi_threshold      = 0.90    ; same measured set as the 7x24 config
                               ;   64 % of the signals, so the threshold is relaxed
                               ;   a little to keep the trade count up. Offline
                               ;   replay on 2026-11-06 ticks: 0.95 -> 26 candidates,
@@ -104,9 +116,9 @@ entry_timeout_ticks = 4
 entry_taker        = 1      ; IOC at the opponent price: SimNow cancels a resting
                             ;   quote within 80-300 ms (measured 2026-11-06), so a passive
                             ;   entry only burns the signal - 5 fills out of 19 orders.
-profit_ticks       = 8      ; TP limit rests at entry +/- 8 ticks (ag: ~2 ticks of fee must sit inside)
+profit_ticks       = 16     ; 8 -> 16: R:R 2.0 is what a 55-62 % win rate needs
 close_timeout_ticks = 6
-stop_loss_ticks    = 6      ; price stop: touch 6 ticks against entry -> cancel TP, IOC stop
+stop_loss_ticks    = 8      ; 6 -> 8: 6 sits inside the ag noise band
 stop_slippage_ticks = 2     ; a limit IOC prints at the best level that has volume, so the
                             ;   cross width costs nothing there - it only decides whether the
                             ;   order still reaches a level with bids/offers. 1 tick missed
@@ -126,7 +138,7 @@ tp_repost_max      = 0      ; 0 = never rest a TP. SimNow cancels every
                               ;   always the price-trigger IOC anyway, plus up to
                               ;   8 dead orders per round trip at the counter
                             ;   the price-triggered IOC (fewer orders -> less throttling)
-max_spread_ticks   = 2      ; skip entries while ask1-bid1 > 2 ticks. The bracket target is
+max_spread_ticks   = 1      ; 2 -> 1: the target is measured from the fill
                             ;   measured from the FILL, so every extra tick of spread is a
                             ;   tick the mid must travel before the TP can print
 trend_window_ms    = 30000  ; overshoot window (30 s of mid). Measured over 69

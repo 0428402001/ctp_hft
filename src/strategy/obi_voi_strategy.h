@@ -153,6 +153,42 @@ private:
         double voi = 0.0;           // normalized to roughly [-1, 1]
         int tickCount = 0;
 
+        // ---- touch history for the stall filter -------------------------------
+        // Last 32 bid/ask touches in a power-of-two ring: min/max over the
+        // last stall_window_ticks is a short linear scan, zero allocation.
+        static constexpr uint32_t kTouchRing = 32;
+        double bidRing[kTouchRing] = {};
+        double askRing[kTouchRing] = {};
+        uint32_t touchHead = 0;    // next write slot
+        uint32_t touchCount = 0;
+        void touchPush(double b, double a) {
+            bidRing[touchHead] = b;
+            askRing[touchHead] = a;
+            touchHead = (touchHead + 1) & (kTouchRing - 1);
+            if (touchCount < kTouchRing) ++touchCount;
+        }
+        // min bid / max ask over the newest k entries (k clamped to what we have)
+        double bidMin(uint32_t k) const {
+            if (touchCount == 0) return 0.0;
+            if (k > touchCount) k = touchCount;
+            double m = 1e18;
+            for (uint32_t i = 0; i < k; ++i) {
+                const double v = bidRing[(touchHead + kTouchRing - 1 - i) & (kTouchRing - 1)];
+                if (v > 0 && v < m) m = v;
+            }
+            return m == 1e18 ? 0.0 : m;
+        }
+        double askMax(uint32_t k) const {
+            if (touchCount == 0) return 0.0;
+            if (k > touchCount) k = touchCount;
+            double m = -1.0;
+            for (uint32_t i = 0; i < k; ++i) {
+                const double v = askRing[(touchHead + kTouchRing - 1 - i) & (kTouchRing - 1)];
+                if (v > m) m = v;
+            }
+            return m < 0 ? 0.0 : m;
+        }
+
         // ---- signal bookkeeping ----------------------------------------------
         bool armedBuy = true;   // may fire BUY (sell extreme + VOI > 0); re-arms while VOI > 0
         bool armedSell = true;  // may fire SELL (buy extreme + VOI < 0); re-arms while VOI < 0
@@ -197,6 +233,12 @@ private:
         // streak guard
         int consecStops = 0;
         int64_t pauseUntilNs = 0;
+        // set once the breakeven stop has been armed this round trip (log once)
+        bool beArmed = false;
+        // The counter refused an order because the session is closed. Nothing
+        // can be sent until this deadline: rotating offset flags only produces
+        // more rejections (2026-11-10 15:21:04, after the 15:00 close).
+        int64_t marketClosedUntilNs = 0;
         // sign of the extreme the entry faded: +1 buy extreme (we sold), -1 sell
         // extreme (we bought). VOI moving into this direction again = wrong.
         int fadeSign = 0;
@@ -352,6 +394,24 @@ private:
     // entry over the last trend_window_ms.
     int trendWindowMs_ = 0;       // 0 = filter off
     int trendMinTicks_ = 1;       // required overshoot, in ticks, against the entry
+    // Stall filter ("has the impulse actually stopped?"). The 30 s drift filter
+    // above only knows that price ran; it cannot tell a 20 s old overshoot from
+    // an impulse that started 2 s ago. Every <= 10 s stop-out in the 2026-11-10
+    // day session (8 trips, -40 ticks) was an entry taken while the extreme was
+    // still being extended. This requires the price to have come back off the
+    // extreme printed in the last stall_window_ticks ticks by entry_stall_ticks.
+    // Backtest on the 131 k tick log: night +4.13 -> +4.53 tick/trade with the
+    // same trades taken (2 ticks off the extreme), day-session bleed halved.
+    int entryStallTicks_ = 2;     // 0 = filter off
+    int stallWindowTicks_ = 6;    // look-back for the extreme being faded
+    // Breakeven ratchet: after N ticks of profit the stop moves to the entry
+    // price, so a round trip that worked cannot turn into a full stop-out.
+    // 2026-11-10: 13 trips printed >= +7 ticks and 5 of them closed <= -6.
+    int breakevenTicks_ = 8;      // 0 = off
+    // Do not open new positions in the last N seconds of an entry window: the
+    // 2026-11-10 run bought at 14:59:15 (45 s before the SHFE close), then the
+    // close order at 15:21 was refused because the market was shut.
+    int entryBlackoutSec_ = 300;  // 0 = off
     // Streak guard: after N losing round trips in a row, stop looking for
     // entries for pause_seconds. A fade bleeds in a trend and the per-round
     // cooldown (20 ticks ~ 10 s) is far too short to notice one.
@@ -368,6 +428,9 @@ private:
     // Empty = 24 h (old behaviour).
     std::vector<std::pair<int, int>> sessions_;   // seconds of day, [from, to)
     bool inSession(const TickMsg& tick) const;
+    // true when the tick sits inside an entry window but within
+    // entry_blackout_sec of that window's END (no new entries there).
+    bool nearSessionEnd(const TickMsg& tick) const;
     int tradeVolume_ = 1;
     int maxPosition_ = 1;
     int cooldownTicks_ = 5;

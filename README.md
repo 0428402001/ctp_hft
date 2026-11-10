@@ -323,6 +323,14 @@ close_timeout_ticks = 6     ; 平仓被动单的 VOI 反向超时
 tp_repost_interval_ticks = 20   ; TP 被外部撤掉后，最快每 20 tick 补挂一次
 tp_repost_max     = 8       ; 每回合最多补挂 8 次，超过转为纯价格触发 IOC
 
+; ---- 入场质量（2026-11-10 实盘复盘后新增）----
+entry_stall_ticks  = 2      ; 价格必须已从近 stall_window_ticks 个 tick 的极值
+                            ;   回撤 N tick 才允许入场（0 = 关）。30 s 漂移过滤
+                            ;   分不清"20 秒前的超调"和"2 秒前才启动的脉冲"
+stall_window_ticks = 6      ; 上述极值的回看窗口
+breakeven_ticks    = 8      ; 浮盈达到 N tick 后止损上移到开仓价（只朝有利方向）
+entry_blackout_sec = 300    ; 窗口结束前 N 秒不再开新仓（14:59 开仓 = 收盘平不掉）
+
 ; ---- 风控 ----
 consec_stop_pause = 3       ; 连续 N 笔亏损回合 -> 停手 pause_seconds
 pause_seconds     = 300     ; 停手时长（趋势日保护）
@@ -605,6 +613,27 @@ obi_voi: entry windows = 21:00-02:30 (everything else: exits only)
 是按“中价走 9 跳 / 5 跳”的不对称结构，是否要按趋势状态（例如 20 tick 中价斜率）动态
 停手，得先回测再改——不要凭盘中手感调参。
 
+### 7.5 2026-11-10 实盘复盘（ag2702 日盘 71 笔报单）
+
+用户导出的柜台委托单（09:30–15:21，含 8 笔撤单）做 FIFO 回合配对：**31 个回合，
+毛 −51 tick（−765 元），手续费约 602 元，净约 −1367 元，胜率 32%**。三个结论：
+
+1. **参数是旧的**：盈利单集中在 +7…+9 tick、亏损单集中在 −5…−9 tick，正是
+   `profit=8 / stop_loss=6 + 2 tick 止损滑点` 的指纹。回放 131 783 条真实 tick：
+   `tp8/sl6` 夜盘 −2.09 tick/笔、日盘 −8.39；`tp16/sl8` 夜盘 +4.13、日盘 −4.89。
+   仓库配置里确实还是 8/6（调参没落盘），已统一改成 16/8 + `trade_sessions`。
+2. **亏损全在"入场后 30 秒内"**：持仓 ≤30 s 的 18 笔合计 −75 tick（胜率 12%/20%），
+   >30 s 的 13 笔 +24 tick。这不是止损太紧，是**入场时脉冲还在延展**——30 s 漂移
+   过滤只看"跑过没有"，分不清"20 秒前的超调"和"2 秒前刚启动"。新增
+   `entry_stall_ticks=2`：必须已从近 6 tick 的极值回撤 2 tick 才允许入场。
+3. **收盘前 45 秒开了仓**：14:59:15 买开，15:21:04 的平仓被 SHFE 拒绝
+   （"当前状态禁止此项操作"），仓位扛过收盘。修了两处：`entry_blackout_sec=300`
+   （窗口结束前 5 分钟禁开新仓）、订单被拒时识别"休市"类错误 → 10 分钟内不再发单，
+   吃单逻辑照旧只记日志不重试。
+
+另外 `breakeven_ticks=8`：13 个回合曾摸到 ≥ +7 tick，其中 5 个最终收在 ≤ −6，
+保本止损把这些"赚过又还回去"的回合锁在 0 附近。
+
 ## 8. 运维与审计工具
 
 ```bat
@@ -632,6 +661,9 @@ tools\qry_watch.sh    :: 多前置轮询版
 
 :: 策略回测：本机录的 tick 数据回放参数网格（含费用）
 python tools\bt_sweep.py
+python tools\bt_sweep.py --eval 0.90,0.10,1,16,8,300 --session night --stall 2 --be 8
+::   --stall N  入场要求价格已从近 --stall-win 个 tick 的极值回撤 N tick
+::   --be M     浮盈 M tick 后止损移到开仓价（保本）
 
 :: 推代码：本机到 github.com:443 不通，走 api.github.com 的 git-data 接口
 set GITHUB_TOKEN=ghp_xxx                :: classic token，勾 repo
