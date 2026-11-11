@@ -82,12 +82,12 @@ def kill_all() -> None:
 
 
 def alive(name: str) -> bool:
-    r = run(["tasklist", "/fi", f"imagename eq {name}.exe", "/nh"])
-    return name.encode() in r.stdout
+    r = run(["tasklist", "/fi", f"imagename eq {name}_proc.exe", "/nh"])
+    return f"{name}_proc".encode() in r.stdout
 
 
 def start_one(name: str, cfg: str, bin_dir: Path) -> subprocess.Popen:
-    exe = bin_dir / f"{name}.exe"
+    exe = bin_dir / f"{name}_proc.exe"
     log = io.open(LOG / f"{name}_stdout.txt", "ab")
     return subprocess.Popen(
         [str(exe), "--config", cfg, "--mode", "live", "--no-console"],
