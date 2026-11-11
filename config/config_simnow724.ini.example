@@ -94,8 +94,10 @@ name = obi_voi
 ;  came from a 1.5-day sample (night +4.13 / day -4.89 tick per trip) - too
 ;  small to trust, so the default runs 24 h and keeps collecting samples.
 trade_sessions     =
-window_ticks       = 10      ; 16 -> 10: the stall filter below now covers the
-                              ;   short horizon, so the OBI window can react faster
+window_ticks       = 16      ; back to 16: the 16 -> 10 change was made together
+                              ;   with a stall filter that was later measured and
+                              ;   switched off, so the shorter window lost its reason.
+                              ;   Kept identical to config_simnow.ini on purpose.
 obi_threshold      = 0.90    ; 0.92 -> 0.90 together with window 16 -> 10: the
                               ;   measured set that keeps ~66-68 night entries
 voi_ema_ticks      = 5
