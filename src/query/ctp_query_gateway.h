@@ -64,6 +64,15 @@ public:
     void OnRspQryInstrument(CThostFtdcInstrumentField* pInstrument, CThostFtdcRspInfoField* pRspInfo,
                             int nRequestID, bool bIsLast) override;
     void OnRspError(CThostFtdcRspInfoField* pRspInfo, int nRequestID, bool bIsLast) override;
+#if defined(HFT_CTP_STD)
+    // A query session must confirm the settlement before the counter answers
+    // account / position queries. Without it both replies come back empty and
+    // the snapshot keeps its default (balance 1 000 000, pos 0) - the bug that
+    // made query.log print a fake account for the whole 2026-11-11 session.
+    void OnRspSettlementInfoConfirm(CThostFtdcSettlementInfoConfirmField* pSettlementInfoConfirm,
+                                    CThostFtdcRspInfoField* pRspInfo, int nRequestID,
+                                    bool bIsLast) override;
+#endif
 
 private:
     // One refresh round, executed as a spaced-out sequence of queries.
@@ -74,6 +83,9 @@ private:
 
     void authenticate();
     void login();
+#if defined(HFT_CTP_STD)
+    void confirmSettlement();
+#endif
     // Publishes the staged results into the shared snapshot (seqlock write).
     void publish();
     // Called by every response handler on its final record: the snapshot is
@@ -91,7 +103,11 @@ private:
     SnapshotBlock* snapshot_;
     CThostFtdcTraderApi* api_ = nullptr;
     std::atomic<bool> loggedIn_{false};
+    std::atomic<bool> settleConfirmed_{false};
     std::atomic<int> requestId_{0};
+    int64_t loginNs_ = 0;         // login time, for the settlement grace window
+    int64_t roundStartNs_ = 0;    // start of the current refresh round
+    bool settleWarned_ = false;   // the "querying without settlement" note is one-shot
 
     // Staging area: results are accumulated here and published to the shared
     // snapshot in one seqlock-protected burst.

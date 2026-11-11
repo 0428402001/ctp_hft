@@ -113,8 +113,28 @@ protected:
         // 4) periodic account summary
         if (now - lastStatNs_ >= 5000000000ll) {
             lastStatNs_ = now;
+            // In live mode balance_/available_/book_ are never filled - the
+            // broker's answer goes straight into the shared snapshot (see
+            // CtpQueryGateway::publish). Printing the members reported a fake
+            // "balance=1000000.00 pos=0" account for hours on 2026-11-11 while
+            // the snapshot held the real 20 996 125. Read back what was
+            // published, so the log and the snapshot can never disagree.
+            double bal = balance_, avail = available_, margin = marginUsed_;
+            double realized = realized_, fee = feePaid_;
+            size_t pos = book_.size();
+            if (!simulation()) {
+                SnapshotReader rd(channels().snapshot());
+                if (rd.read()) {
+                    bal = rd.account().balance;
+                    avail = rd.account().available;
+                    margin = rd.account().currMargin;
+                    realized = rd.account().closeProfit;
+                    fee = rd.account().commission;
+                    pos = rd.positionCount();
+                }
+            }
             HFT_LOGI("account balance=%.2f available=%.2f margin=%.2f realized=%.2f fee=%.2f pos=%zu execs=%llu",
-                     balance_, available_, marginUsed_, realized_, feePaid_, book_.size(),
+                     bal, avail, margin, realized, fee, pos,
                      static_cast<unsigned long long>(execSeen_));
         }
         return any;

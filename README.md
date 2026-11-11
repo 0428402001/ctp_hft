@@ -828,7 +828,8 @@ python tools\gh_push_api.py
 | 反复 4097 限流越重连越久 | SimNow 前置 IP 级惩罚 | 180 s 冷却 / 15 min 3 次上限 / 6 次超时静默 300 s |
 | 守护误判“全死”自杀进程树 | `tasklist` 异常被当成空集 | 探测失败返回 `None`（未知），<10 行不可信，PS 兜底 |
 | `.bat` 报“此时不应有 .。” | `if (...)` 块里的裸括号未转义 | 括号写 `^(` `^)` |
-| 脚本 LF 换行报 “unexpected at this time” | cmd 解析括号块要求 CRLF | `.bat` 一律 CRLF；延时用 `ping -n N+1 127.0.0.1 >nul` |
+| 脚本 LF 换行报 “unexpected at this time” | cmd 解析括号块要求 CRLF；LF 版还会把 `start /b` 拆成 `tart`、并凭空生成 `12` / `next` 空文件 | `.bat` 一律 CRLF，仓库加 `.gitattributes`（`*.bat text eol=crlf`）锁死；延时用 `ping -n N+1 127.0.0.1 >nul` |
+| `query.log` 一直打印 `balance=1000000 pos=0`，而快照里是 2000 万（11-11） | 两处：查询会话没做结算确认；日志打印的是 `simulation` 才会赋值的成员 | `CtpQueryGateway` 登录后 `ReqSettlementInfoConfirm`；统计行在 live 模式改读共享快照（`SnapshotReader`） |
 | 19 笔报单只成 5 笔（11-06 09:00） | 白天配置缺 `entry_taker`，`bid1+1` 在 2 跳价差里没跨过去，柜台 80–300 ms 就撤 | 白天也 `entry_taker=1`；`max_spread_ticks=2` 过滤宽价差 |
 | 止盈挂在 12453 而不是 12447 | 成交回报未匹配到在途单，`entryPrice` 没写，TP 回退到盘口价 | 任何 open 成交都记 `entryPrice`（不再限于 `tracked`） |
 | 止损一笔亏 13 跳（应为 6） | 止损 IOC 只跨 1 跳，急跌里连追 3 次（12433→12431→12425） | `stop_slippage_ticks=2` + 逃逸每 2 次加宽 1 跳（上限 +6） |
@@ -861,3 +862,7 @@ python tools\gh_push_api.py
 * `shm_reset.exe` 会清整条总线，**运行中调用等于让四个进程失联**，只在冷启动脚本里用。
 * 策略的本地账本与柜台持仓若长期不一致（`staleBrokerRounds` 连续多轮），会强制重启策略
   做一次 `flatten_on_start` 对账；这是已知的唯一“自愈式丢状态”路径。
+* **SimNow 7×24 环境的行情不能当业绩看**：2026-11-11 17:00 实测，tick 里的
+  `updateTime` 比墙钟快约 7 分钟，且价格会跳段（17:23 一笔空单从 12727 直接跳到
+  12828 成交，+101 tick）。它适合验证链路（下单/成交/止盈/止损/保活），
+  不适合评估策略盈亏；统计时剔除单笔 >20 tick 的离群值。

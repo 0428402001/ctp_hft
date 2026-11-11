@@ -129,12 +129,72 @@ void CtpQueryGateway::OnRspUserLogin(CThostFtdcRspUserLoginField* pRspUserLogin,
     }
     if (pRspUserLogin) copyStr(stagingAccount_.tradingDay, pRspUserLogin->TradingDay);
     loggedIn_.store(true, std::memory_order_release);
+    loginNs_ = nowNs();
     if (statusSink_) statusSink_("logged in");
     HFT_LOGI("query session logged in");
+#if defined(HFT_CTP_STD)
+    // Account / position queries return nothing until the settlement is
+    // confirmed on THIS session. Order matters: confirm first, query later.
+    confirmSettlement();
+#endif
 }
+
+#if defined(HFT_CTP_STD)
+void CtpQueryGateway::confirmSettlement() {
+    CThostFtdcSettlementInfoConfirmField req;
+    std::memset(&req, 0, sizeof(req));
+    copyStr(req.BrokerID, cfg_.brokerId().c_str());
+    copyStr(req.InvestorID, cfg_.investorId().c_str());
+    const int rc = api_->ReqSettlementInfoConfirm(&req, ++requestId_);
+    if (rc != 0) HFT_LOGW("query: settlement confirm submit failed (rc=%d)", rc);
+    else HFT_LOGI("query: settlement confirmation requested");
+}
+
+void CtpQueryGateway::OnRspSettlementInfoConfirm(
+    CThostFtdcSettlementInfoConfirmField* pSettlementInfoConfirm,
+    CThostFtdcRspInfoField* pRspInfo, int nRequestID, bool bIsLast) {
+    (void)pSettlementInfoConfirm; (void)nRequestID; (void)bIsLast;
+    if (isError(pRspInfo)) {
+        // "Already confirmed" is reported as an error by some counters; unlock
+        // anyway, otherwise the snapshot stays empty for the whole session.
+        HFT_LOGW("query: settlement confirm rejected: %s", describe(pRspInfo).c_str());
+    } else {
+        HFT_LOGI("query: settlement confirmed - account/position queries enabled");
+    }
+    settleConfirmed_.store(true, std::memory_order_release);
+}
+#endif
 
 void CtpQueryGateway::refreshAll() {
     if (!api_ || !loggedIn_.load(std::memory_order_acquire)) return;
+    const int64_t now = nowNs();
+
+    // A round that never completes (the counter dropped one reply) used to
+    // block every later round forever: collecting_ stayed true and the
+    // snapshot kept its default values. Recover instead of waiting.
+    if (collecting_.load(std::memory_order_acquire)) {
+        if (roundStartNs_ != 0 && now - roundStartNs_ > 15000000000ll) {
+            HFT_LOGW("query: previous round stalled >15 s (missing reply) - restarting");
+            std::lock_guard<std::mutex> lk(collectMtx_);
+            tasks_.clear();
+            taskIdx_ = 0;
+            noted_ = 0;
+            collecting_.store(false, std::memory_order_release);
+        } else {
+            return;   // previous round still running
+        }
+    }
+
+    // Give the settlement confirmation a few seconds to land; querying before
+    // it is answered silently returns an empty account on SimNow.
+    if (!settleConfirmed_.load(std::memory_order_acquire) && now - loginNs_ < 5000000000ll) {
+        return;
+    }
+    if (!settleConfirmed_.load(std::memory_order_acquire) && !settleWarned_) {
+        settleWarned_ = true;
+        HFT_LOGW("query: settlement not confirmed after 5 s - querying anyway "
+                 "(account/position replies may be empty)");
+    }
     if (collecting_.exchange(true)) return;  // previous round still running
 
     // Queue the round. The queries are submitted one at a time by pump():
@@ -150,6 +210,7 @@ void CtpQueryGateway::refreshAll() {
         tasks_ = std::move(tasks);
         taskIdx_ = 0;
         noted_ = 0;
+        roundStartNs_ = now;
     }
     pump(nowNs());   // submits the first task right away (last send was >= 3 s ago)
 }
