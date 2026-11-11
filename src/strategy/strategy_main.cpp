@@ -53,9 +53,11 @@ public:
     struct BrokerSlot { char instrument[kInstrumentLen]; BrokerPosition bp; };
 
     StrategyContextImpl(CmdChannel* commands, ChannelEvent* commandsEvt, ControlBlock* control,
-                        MarketSnapshotBlock* market, SnapshotBlock* snapshot)
+                        MarketSnapshotBlock* market, SnapshotBlock* snapshot, bool simulation)
         : commands_(commands), commandsEvt_(commandsEvt), control_(control), market_(market),
-          reader_(snapshot) {}
+          reader_(snapshot), simulation_(simulation) {}
+
+    bool simulationMode() const override { return simulation_; }
 
     // Linear find-or-insert over a fixed slot table. insert=false never
     // grows the table (read-only lookups for unknown instruments).
@@ -96,14 +98,11 @@ public:
         cmd.timeCondition = timeCondition ? timeCondition : '1';  // '1' GFD, '3' IOC
         cmd.volumeCondition = '1'; // any volume
         cmd.strategyTag = tag;
-        cmd.sendTimeNs = nowNs();
-        const bool wasEmptyBeforePush = commands_->empty();
-        if (!commands_->push(cmd)) {
+        cmd.sendTimeNs = monotonicNowNs();
+        if (!pushCommand(cmd)) {
             --cmdId_;
             return 0;
         }
-        // doorbell: wake the trader process (only on empty -> non-empty)
-        if (commandsEvt_ && wasEmptyBeforePush) commandsEvt_->notify();
         return cmd.cmdId;
     }
 
@@ -120,14 +119,11 @@ public:
         cmd.frontID = order.frontID;
         cmd.sessionID = order.sessionID;
         cmd.strategyTag = tag;
-        cmd.sendTimeNs = nowNs();
-        const bool wasEmptyBeforePush = commands_->empty();
-        if (!commands_->push(cmd)) {
+        cmd.sendTimeNs = monotonicNowNs();
+        if (!pushCommand(cmd)) {
             --cmdId_;
             return 0;
         }
-        // doorbell: wake the trader process (only on empty -> non-empty)
-        if (commandsEvt_ && wasEmptyBeforePush) commandsEvt_->notify();
         return cmd.cmdId;
     }
 
@@ -140,14 +136,11 @@ public:
         cmd.type = CmdType::CancelAll;
         copyStr(cmd.instrument, instrument);
         cmd.strategyTag = tag;
-        cmd.sendTimeNs = nowNs();
-        const bool wasEmptyBeforePush = commands_->empty();
-        if (!commands_->push(cmd)) {
+        cmd.sendTimeNs = monotonicNowNs();
+        if (!pushCommand(cmd)) {
             --cmdId_;
             return 0;
         }
-        // doorbell: wake the trader process (only on empty -> non-empty)
-        if (commandsEvt_ && wasEmptyBeforePush) commandsEvt_->notify();
         return cmd.cmdId;
     }
 
@@ -159,22 +152,22 @@ public:
     double lastPrice(const char* instrument) const override {
         const TickMsg* t = lastTick(instrument);
         if (t) return t->lastPrice;
-        const MarketTickSnap* s = marketSnap(instrument);
-        return s ? s->lastPrice : 0.0;
+        MarketTickSnap s{};
+        return marketSnap(instrument, s) ? s.lastPrice : 0.0;
     }
 
     double bidPrice(const char* instrument) const override {
         const TickMsg* t = lastTick(instrument);
         if (t && t->bidPrice1 > 0) return t->bidPrice1;
-        const MarketTickSnap* s = marketSnap(instrument);
-        return s ? s->bidPrice1 : 0.0;
+        MarketTickSnap s{};
+        return marketSnap(instrument, s) ? s.bidPrice1 : 0.0;
     }
 
     double askPrice(const char* instrument) const override {
         const TickMsg* t = lastTick(instrument);
         if (t && t->askPrice1 > 0) return t->askPrice1;
-        const MarketTickSnap* s = marketSnap(instrument);
-        return s ? s->askPrice1 : 0.0;
+        MarketTickSnap s{};
+        return marketSnap(instrument, s) ? s.askPrice1 : 0.0;
     }
 
     double priceTick(const char* instrument) const override {
@@ -336,15 +329,14 @@ public:
     }
 
 private:
-    const MarketTickSnap* marketSnap(const char* instrument) const {
-        if (!market_) return nullptr;
-        const uint32_t n = market_->count.load(std::memory_order_acquire);
-        for (uint32_t i = 0; i < n && i < kMaxMarketInstruments; ++i) {
-            if (std::strncmp(market_->items[i].instrument, instrument, kInstrumentLen) == 0) {
-                return &market_->items[i];
-            }
-        }
-        return nullptr;
+    bool pushCommand(const OrderCommand& cmd) {
+        if (!commands_) return false;
+        if (commandsEvt_) return Channels::pushNotify(*commands_, *commandsEvt_, cmd);
+        return commands_->push(cmd);
+    }
+
+    bool marketSnap(const char* instrument, MarketTickSnap& out) const {
+        return market_ && market_->find(instrument, out);
     }
 
     // Instrument metadata, cached lazily: a lookup miss reads ONE record
@@ -371,6 +363,7 @@ private:
     ControlBlock* control_;
     MarketSnapshotBlock* market_;
     SnapshotReader reader_;
+    bool simulation_ = true;
 
     // Fixed hot tables (see class comment). Mutable: filled from the const
     // accessor instrumentOf() and from const setTick() call paths.
@@ -425,7 +418,7 @@ protected:
         }
 
         ctx_.reset(new StrategyContextImpl(channels().commands(), &channels().commandsEvt(), control(), channels().market(),
-                                           channels().snapshot()));
+                                           channels().snapshot(), simulation()));
         ctx_->setFallbackInstrumentInfo(config().getDouble("sim", "price_tick", 1.0),
                                        config().getInt("sim", "volume_multiple", 10));
 
@@ -445,12 +438,22 @@ protected:
     bool onPoll() override {
         bool any = false;
 
+        const uint32_t faults = control()->dataFaults.load(std::memory_order_acquire);
+        if (faults != 0) {
+            control()->tradingEnabled.store(0, std::memory_order_release);
+            if (faults != reportedFaults_) {
+                HFT_LOGE("data-integrity fault flags=0x%X; new entries are disabled until cold restart",
+                         faults);
+                reportedFaults_ = faults;
+            }
+        }
+
         // 1) ticks (bulk pop keeps the per-tick overhead tiny)
         TickMsg buf[256];
         const uint32_t n = channels().ticks()->popBulk(buf, 256);
         for (uint32_t i = 0; i < n; ++i) {
             ctx_->setTick(buf[i]);
-            latencySumNs_ += wallNowNs() - buf[i].publishTimeNs;
+            recordTickLatency(monotonicNowNs() - buf[i].publishTimeNs);
             strategy_->onTick(buf[i]);
         }
         if (n > 0) {
@@ -508,32 +511,84 @@ protected:
         handles.push_back(channels().qryRspEvt().handle());
     }
 
+    bool prepareWait() override {
+        bool ready = channels().prepareTicksWait();
+        ready = channels().prepareExecsWait() && ready;
+        ready = channels().prepareQryRspWait() && ready;
+        return ready;
+    }
+
 private:
+    void recordTickLatency(int64_t latencyNs) {
+        if (latencyNs < 0) return;
+        static constexpr uint64_t kUpperNs[] = {
+            1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000,
+            500000, 1000000, 2000000, 5000000, 10000000, 20000000,
+            50000000, UINT64_MAX};
+        uint32_t bucket = 0;
+        while (bucket + 1 < sizeof(kUpperNs) / sizeof(kUpperNs[0]) &&
+               static_cast<uint64_t>(latencyNs) > kUpperNs[bucket]) ++bucket;
+        ++latencyBuckets_[bucket];
+        ++latencyCount_;
+        latencySumNs_ += static_cast<uint64_t>(latencyNs);
+        if (static_cast<uint64_t>(latencyNs) > maxLatencyNs_)
+            maxLatencyNs_ = static_cast<uint64_t>(latencyNs);
+    }
+
+    uint64_t latencyPercentileNs(double percentile) const {
+        if (latencyCount_ == 0) return 0;
+        const uint64_t target = static_cast<uint64_t>(latencyCount_ * percentile + 0.999999);
+        uint64_t seen = 0;
+        static constexpr uint64_t kUpperNs[] = {
+            1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000,
+            500000, 1000000, 2000000, 5000000, 10000000, 20000000,
+            50000000, UINT64_MAX};
+        for (uint32_t i = 0; i < sizeof(kUpperNs) / sizeof(kUpperNs[0]); ++i) {
+            seen += latencyBuckets_[i];
+            if (seen >= target) return i + 1 == sizeof(kUpperNs) / sizeof(kUpperNs[0])
+                                         ? maxLatencyNs_
+                                         : kUpperNs[i];
+        }
+        return maxLatencyNs_;
+    }
+
     void printStats(int64_t now) {
         if (lastStatNs_ == 0) {
             lastStatNs_ = now;
             return;
         }
         const double secs = static_cast<double>(now - lastStatNs_) / 1e9;
-        const double avgLatencyUs = tickCount_ > 0 ? (static_cast<double>(latencySumNs_) / static_cast<double>(tickCount_) / 1000.0) : 0.0;
-        HFT_LOGI("ticks=%llu (%.1f/s) execs=%llu tick->strategy latency=%.1f us backlog=%llu",
+        const double avgLatencyUs = latencyCount_ > 0
+                                        ? static_cast<double>(latencySumNs_) /
+                                              static_cast<double>(latencyCount_) / 1000.0
+                                        : 0.0;
+        HFT_LOGI("ticks=%llu (%.1f/s) execs=%llu tick->strategy avg=%.1f us p50<=%.1f p99<=%.1f max=%.1f us backlog=%llu",
                  static_cast<unsigned long long>(tickCount_),
                  static_cast<double>(tickCount_) / secs,
                  static_cast<unsigned long long>(execCount_), avgLatencyUs,
+                 latencyPercentileNs(0.50) / 1000.0,
+                 latencyPercentileNs(0.99) / 1000.0, maxLatencyNs_ / 1000.0,
                  static_cast<unsigned long long>(channels().ticks()->size()));
         lastStatNs_ = now;
         tickCount_ = 0;
         execCount_ = 0;
         latencySumNs_ = 0;
+        latencyCount_ = 0;
+        maxLatencyNs_ = 0;
+        std::memset(latencyBuckets_, 0, sizeof(latencyBuckets_));
     }
 
     std::unique_ptr<StrategyContextImpl> ctx_;
     std::unique_ptr<Strategy> strategy_;
     uint64_t tickCount_ = 0;
     uint64_t execCount_ = 0;
-    int64_t latencySumNs_ = 0;
+    uint64_t latencySumNs_ = 0;
+    uint64_t latencyCount_ = 0;
+    uint64_t maxLatencyNs_ = 0;
+    uint64_t latencyBuckets_[16]{};
     int64_t lastTimerNs_ = 0;
     int64_t lastStatNs_ = 0;
+    uint32_t reportedFaults_ = 0;
 };
 
 } // namespace hft

@@ -62,7 +62,7 @@ startup_retry_ms    = 10000
 clean_flow_on_start = true
 mode        = live
 log_dir     = ./log
-instruments = ag2612
+instruments = ag2702
 heartbeat_ms = 500
 ; latency tuning: hybrid spin wait + HIGH priority (see config.ini)
 spin_us      = 500
@@ -152,17 +152,17 @@ stall_window_ticks = 6
 ; Once the trip has printed breakeven_ticks of profit the stop moves to the
 ; entry price and never moves back.
 breakeven_ticks    = 8
-; No new entries in the last entry_blackout_sec of a window.
-entry_blackout_sec = 300
+; No new entries in the last 30 minutes of a window. For a 15:00 close,
+; entries stop at 14:30, avoiding the late-day losses in the 2026-11-10 report.
+entry_blackout_sec = 1800
 ; ===== daily loss circuit breaker ==========================================
 ; Per-trade stops bound one trade; nothing bounded the DAY. Once realised
 ; losses for the trading day reach this many ticks (per lot), no new entries
 ; are opened - open positions still exit through their bracket. The budget
 ; resets when the exchange trading day rolls.
-daily_loss_limit_ticks = 40
-; Start-up audit: refuse to boot when max_spread_ticks != 1, trade_sessions is
-; empty, or profit_ticks < 12. Set to 1 only for backtests.
-allow_loose_risk   = 0
+daily_loss_limit_ticks = 35
+; Historical sample deviations are logged as warnings; they are not global
+; startup gates. Live trading fails closed when no valid trade_sessions exist.
 consec_stop_pause  = 3      ; after 3 losing round trips in a row, stop looking for
                             ;   entries for pause_seconds. A fade bleeds in a trend;
                             ;   2026-11-06 11:02-11:04 three shorts stopped -5/-6/-6

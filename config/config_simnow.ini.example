@@ -64,7 +64,7 @@ startup_retry_ms    = 10000
 clean_flow_on_start = true
 mode        = live
 log_dir     = ./log
-instruments = ag2612
+instruments = ag2702
 heartbeat_ms = 500
 ; latency tuning: hybrid spin wait + HIGH priority (see config.ini)
 spin_us      = 500
@@ -86,22 +86,10 @@ entry_stall_ticks  = 0
 stall_window_ticks = 6
 ; Breakeven ratchet: stop moves to entry after N ticks of profit.
 breakeven_ticks    = 8
-; No new entries in the last N seconds of a window.
-entry_blackout_sec = 300
-daily_loss_limit_ticks = 40
-allow_loose_risk   = 0
-window_ticks AND VOI reversed with at
-;         least voi_entry_threshold magnitude AND the current OBI has receded
-;         from the extreme (decay confirmation) -> fade on the WEAK side
-;  exit : the moment the entry fills a take-profit LIMIT rests at
-;         entry +/- profit_ticks and is NEVER pulled except:
-;           - price reaches stop_loss_ticks against entry -> cancel the TP
-;             and fire an IOC stop crossed stop_slippage_ticks (fills NOW)
-;           - (safety net only) max_hold_ticks held -> cancel + IOC
-;         if the counter auto-kills the resting TP it is re-armed at most
-;         once per tp_repost_interval_ticks, up to tp_repost_max times
-;  inventory: net capped at max_position, at the cap closes only
-; ---------------------------------------------------------------------------
+; No new entries in the last 30 minutes of a window. For a 15:00 close,
+; entries stop at 14:30, avoiding the late-day losses in the 2026-11-10 report.
+entry_blackout_sec = 1800
+daily_loss_limit_ticks = 35
 window_ticks       = 16      ; tightened from 20: the trend filter below now
                               ;   supplies the quality, so the window can react
                               ;   faster and fire more often (user asked for

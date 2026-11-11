@@ -47,6 +47,7 @@ const char* ObiVoiStrategy::phaseName(Phase p) {
 
 bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& err) {
     ctx_ = &ctx;
+    sessionsRequired_ = !ctx.simulationMode();
 
     instruments_ = cfg.instruments();
     windowTicks_ = cfg.getInt("obi_voi", "window_ticks", 10);
@@ -78,7 +79,7 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
     entryStallTicks_ = cfg.getInt("obi_voi", "entry_stall_ticks", 2);
     stallWindowTicks_ = cfg.getInt("obi_voi", "stall_window_ticks", 6);
     breakevenTicks_ = cfg.getInt("obi_voi", "breakeven_ticks", 8);
-    entryBlackoutSec_ = cfg.getInt("obi_voi", "entry_blackout_sec", 300);
+    entryBlackoutSec_ = cfg.getInt("obi_voi", "entry_blackout_sec", 1800);
     consecStopPause_ = cfg.getInt("obi_voi", "consec_stop_pause", 0);
     pauseSeconds_ = cfg.getInt("obi_voi", "pause_seconds", 300);
 
@@ -94,7 +95,9 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
             const std::string one =
                 sess.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
             int h1 = 0, m1 = 0, h2 = 0, m2 = 0;
-            if (std::sscanf(one.c_str(), " %d:%d - %d:%d", &h1, &m1, &h2, &m2) == 4) {
+            if (std::sscanf(one.c_str(), " %d:%d - %d:%d", &h1, &m1, &h2, &m2) == 4 &&
+                h1 >= 0 && h1 < 24 && h2 >= 0 && h2 < 24 &&
+                m1 >= 0 && m1 < 60 && m2 >= 0 && m2 < 60) {
                 sessions_.emplace_back(h1 * 3600 + m1 * 60, h2 * 3600 + m2 * 60);
             } else {
                 HFT_LOGW("obi_voi: ignoring malformed trade_sessions entry '%s'", one.c_str());
@@ -103,8 +106,13 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
             pos = comma + 1;
         }
         if (sessions_.empty()) {
-            HFT_LOGW("obi_voi: trade_sessions='%s' parsed to nothing, running 24 h",
-                     sess.c_str());
+            if (sessionsRequired_) {
+                HFT_LOGE("obi_voi: trade_sessions='%s' parsed to nothing; live entries fail closed",
+                         sess.c_str());
+            } else {
+                HFT_LOGW("obi_voi: trade_sessions='%s' parsed to nothing; simulation allows all day",
+                         sess.c_str());
+            }
         }
     }
     tradeVolume_ = cfg.getInt("obi_voi", "trade_volume", 1);
@@ -148,9 +156,8 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
     if (entryBlackoutSec_ < 0) entryBlackoutSec_ = 0;
     if (consecStopPause_ < 0) consecStopPause_ = 0;
     if (pauseSeconds_ < 0) pauseSeconds_ = 0;
-    dailyLossLimitTicks_ = cfg.getInt("obi_voi", "daily_loss_limit_ticks", 0);
+    dailyLossLimitTicks_ = cfg.getInt("obi_voi", "daily_loss_limit_ticks", 35);
     if (dailyLossLimitTicks_ < 0) dailyLossLimitTicks_ = 0;
-    allowLooseRisk_ = cfg.getBool("obi_voi", "allow_loose_risk", false);
     if (tradeVolume_ < 1 || maxPosition_ < 1) {
         err = "obi_voi: trade_volume and max_position must be >= 1";
         return false;
@@ -184,44 +191,35 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
     return auditConfig(err);
 }
 
-// Start-up audit. 2026-11-10 cost 1367 CNY in 31 round trips because the live
-// box was still running a config that predated every tuned parameter (day
-// session allowed, spread<=2, tp8/sl6) while the repo held the correct file.
-// A silent mismatch is far more expensive than a refused start, so the three
-// settings that decide the SIGN of the edge are verified here.
+// Report parameter deviations from the narrow historical sample. These are
+// operator warnings, not universal invariants that should kill startup.
 bool ObiVoiStrategy::auditConfig(std::string& err) const {
-    std::string bad;
-    if (maxSpreadTicks_ != 1) {
-        bad += "[max_spread_ticks=" + std::to_string(maxSpreadTicks_) +
-               "] measured on 131k ag ticks: 1 tick -> +4.06 tick/trip, "
-               "2 -> -0.60, 3 -> -2.27. ";
-    }
+    (void)err;
+    // These empirical values came from a narrow instrument/sample and are
+    // diagnostics, not universal safety invariants. In particular, do not
+    // terminate the process because a sim or another instrument uses different
+    // settings. Live mode instead fails closed at the entry gate when no valid
+    // session has been configured.
     if (sessions_.empty()) {
-        bad += "[trade_sessions empty] day-session entries allowed; every day "
-               "configuration backtests negative (-2.5 .. -4.9 tick/trip). ";
+        if (sessionsRequired_) {
+            HFT_LOGE("obi_voi: live mode has no valid trade_sessions; new entries are disabled");
+        } else {
+            HFT_LOGW("obi_voi: no trade_sessions configured; simulation permits entries all day");
+        }
     }
-    if (profitTicks_ < 12) {
-        bad += "[profit_ticks=" + std::to_string(profitTicks_) +
-               "] at spread<=1: 8 -> -1.18 tick/trip, 16 -> +4.06. ";
+    if (sessionsRequired_ && dailyLossLimitTicks_ <= 0) {
+        HFT_LOGE("obi_voi: live mode has no daily loss limit; new entries are disabled");
     }
-    if (bad.empty()) return true;
-    if (allowLooseRisk_) {
-        HFT_LOGW("obi_voi: config audit: %s-- allow_loose_risk=1, starting anyway",
-                 bad.c_str());
-        return true;
+    if (sessionsRequired_ && entryBlackoutSec_ < 300) {
+        HFT_LOGE("obi_voi: live mode requires at least 300 s entry blackout before session end; "
+                 "new entries are disabled");
     }
-    HFT_LOGE("obi_voi: config audit FAILED: %s", bad.c_str());
-    HFT_LOGE("obi_voi: fix the config, or set [obi_voi] allow_loose_risk = 1 to override "
-             "(only for backtests / experiments)");
-    err = "obi_voi: config audit failed: " + bad;
-    // Do NOT hand this back as a normal start-up failure: [general] startup_retry
-    // would loop forever (it exists to survive a closed front), and a silently
-    // retrying process looks perfectly healthy to a supervisor while trading
-    // nothing. A wrong config on disk will not fix itself - exit now.
-    HFT_LOGE("obi_voi: refusing to start, exiting (2)");
-    Logger::instance().close();  // fmtlog is async: only close() forces the write
-    std::_Exit(2);
-    return false;  // unreachable
+    if (maxSpreadTicks_ == 0)
+        HFT_LOGW("obi_voi: max_spread_ticks=0 disables the spread filter");
+    if (profitTicks_ < 12)
+        HFT_LOGW("obi_voi: profit_ticks=%d differs from the narrow historical sample; validate out of sample",
+                 profitTicks_);
+    return true;
 }
 
 ObiVoiStrategy::State& ObiVoiStrategy::state(const char* instrument) {
@@ -401,6 +399,13 @@ void ObiVoiStrategy::onTick(const TickMsg& tick) {
     // Exchange trading day first: the loss budget belongs to the day, and a
     // fresh session must not inherit yesterday's halt.
     rollTradingDay(tick.tradingDay);
+
+    const int64_t tickNowNs = nowNs();
+    if (!firstTickLogged_) {
+        firstTickLogged_ = true;
+        logFirstTick(tick);
+    }
+    logGateReport(tickNowNs, tick);
 
     State& st = state(tick.instrument);
     updateIndicators(st, tick);
@@ -642,9 +647,10 @@ void ObiVoiStrategy::reconcileBook(State& st, const TickMsg& tick) {
 //  a malformed field would be worse than trading the full day.
 // ---------------------------------------------------------------------------
 bool ObiVoiStrategy::inSession(const TickMsg& tick) const {
-    if (sessions_.empty()) return true;
+    if (sessions_.empty()) return !sessionsRequired_;
     int h = 0, m = 0, s = 0;
-    if (std::sscanf(tick.updateTime, "%d:%d:%d", &h, &m, &s) != 3) return true;
+    if (std::sscanf(tick.updateTime, "%d:%d:%d", &h, &m, &s) != 3 ||
+        h < 0 || h > 23 || m < 0 || m > 59 || s < 0 || s > 59) return false;
     const int t = h * 3600 + m * 60 + s;
     for (const auto& w : sessions_) {
         if (w.first <= w.second) {
@@ -663,7 +669,8 @@ bool ObiVoiStrategy::inSession(const TickMsg& tick) const {
 bool ObiVoiStrategy::nearSessionEnd(const TickMsg& tick) const {
     if (sessions_.empty() || entryBlackoutSec_ <= 0) return false;
     int h = 0, m = 0, s = 0;
-    if (std::sscanf(tick.updateTime, "%d:%d:%d", &h, &m, &s) != 3) return false;
+    if (std::sscanf(tick.updateTime, "%d:%d:%d", &h, &m, &s) != 3 ||
+        h < 0 || h > 23 || m < 0 || m > 59 || s < 0 || s > 59) return true;
     const int t = h * 3600 + m * 60 + s;
     const int day = 24 * 3600;
     for (const auto& w : sessions_) {
@@ -678,21 +685,90 @@ bool ObiVoiStrategy::nearSessionEnd(const TickMsg& tick) const {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+//  Operator visibility: an idle strategy must never be silent.
+//  Historical failure this fixes (2026-11-11): the day session produced ZERO
+//  orders for six hours; every heartbeat read "ticks=2/s execs=0" so the run
+//  looked healthy. The real cause - trade_sessions = 21:00-02:30 - returned
+//  from evaluate() three lines in and never logged anything.
+// ---------------------------------------------------------------------------
+void ObiVoiStrategy::logFirstTick(const TickMsg& tick) {
+    int h = 0, m = 0, s = 0;
+    const bool parsed = std::sscanf(tick.updateTime, "%d:%d:%d", &h, &m, &s) == 3;
+    char clock[16] = "??:??:??";
+    if (parsed) std::snprintf(clock, sizeof(clock), "%02d:%02d:%02d", h, m, s);
+    if (sessions_.empty()) {
+        HFT_LOGI("obi_voi: first tick %s at %s - no entry window configured, gate open all day",
+                 tick.instrument, clock);
+        return;
+    }
+    if (inSession(tick)) {
+        HFT_LOGI("obi_voi: first tick %s at %s - INSIDE an entry window", tick.instrument, clock);
+        return;
+    }
+    int best = -1;
+    if (parsed) {
+        const int t = h * 3600 + m * 60 + s;
+        for (const auto& w : sessions_) {
+            int d = w.first - t;
+            if (d <= 0) d += 24 * 3600;
+            if (best < 0 || d < best) best = d;
+        }
+    }
+    if (best >= 0) {
+        HFT_LOGW("obi_voi: first tick %s at %s - OUTSIDE every entry window; "
+                 "no order for the next %02d:%02d (exits are never gated)",
+                 tick.instrument, clock, best / 3600, (best % 3600) / 60);
+    } else {
+        HFT_LOGW("obi_voi: first tick %s at %s - OUTSIDE every entry window",
+                 tick.instrument, clock);
+    }
+}
+
+void ObiVoiStrategy::logGateReport(int64_t now, const TickMsg& tick) {
+    if (lastGateLogNs_ == 0) {
+        lastGateLogNs_ = now;
+        return;
+    }
+    if (now - lastGateLogNs_ < INT64_C(60000000000)) return;  // 60 s
+    lastGateLogNs_ = now;
+    const uint64_t seen = gateTicks_;
+    const uint64_t blocked = gateSession_ + gateBlackout_ + gateHalt_ + gateSpread_;
+    const uint64_t sSession = gateSession_, sCutoff = gateBlackout_;
+    const uint64_t sHalt = gateHalt_, sSpread = gateSpread_;
+    gateTicks_ = gateSession_ = gateBlackout_ = gateHalt_ = gateSpread_ = 0;
+    if (seen == 0 || blocked == 0) return;
+    HFT_LOGW("%s: no entry order in the last 60 s - %llu/%llu ticks blocked "
+             "| outside_session=%llu entry_cutoff=%llu daily_halt=%llu wide_spread=%llu",
+             tick.instrument, static_cast<unsigned long long>(blocked),
+             static_cast<unsigned long long>(seen),
+             static_cast<unsigned long long>(sSession),
+             static_cast<unsigned long long>(sCutoff),
+             static_cast<unsigned long long>(sHalt),
+             static_cast<unsigned long long>(sSpread));
+}
+
 void ObiVoiStrategy::evaluate(State& st, const TickMsg& tick) {
+    ++gateTicks_;
     if (st.obiCount < static_cast<uint32_t>(windowTicks_)) return;  // warm-up
     if (st.cooldownTicks > 0) return;
 
     // ---- session gate: only hunt for entries inside the profitable windows --
-    if (!inSession(tick)) return;
+    if (!inSession(tick)) { ++gateSession_; return; }
+    // Live trading must have a finite loss budget and enough time to manage a
+    // position before the configured session closes. The 2026-11-10 order
+    // report showed a late entry at 14:59 and a close rejected after 15:00.
+    if (sessionsRequired_ &&
+        (dailyLossLimitTicks_ <= 0 || entryBlackoutSec_ < 300)) return;
     // ... and not in the last minutes of one: a position opened there cannot
     // be closed before the exchange shuts (2026-11-10 14:59:15 entry).
-    if (nearSessionEnd(tick)) return;
+    if (nearSessionEnd(tick)) { ++gateBlackout_; return; }
 
     // ---- daily loss circuit breaker -----------------------------------------
     // Checked before anything else that could open a position: once the day's
     // realised loss reaches the limit, a fade strategy in a trending tape would
     // otherwise keep buying the same falling knife until the session ends.
-    if (dailyHalted_) return;
+    if (dailyHalted_) { ++gateHalt_; return; }
 
     // ---- streak guard: stand down while the market is trending against us ---
     if (st.pauseUntilNs) {
@@ -712,6 +788,7 @@ void ObiVoiStrategy::evaluate(State& st, const TickMsg& tick) {
         const double ts = ctx_->priceTick(tick.instrument);
         if (ts > 0 &&
             (tick.askPrice1 - tick.bidPrice1) > maxSpreadTicks_ * ts + 1e-9) {
+            ++gateSpread_;
             return;
         }
     }

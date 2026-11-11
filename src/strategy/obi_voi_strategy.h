@@ -441,7 +441,6 @@ private:
     // and the day session after it are budgeted separately.
     // 0 = off. 40 ticks ~ 600 CNY on one ag lot, about 0.7 daily sigma.
     int dailyLossLimitTicks_ = 0;
-    bool allowLooseRisk_ = false;  // boot audit bypass: [obi_voi] allow_loose_risk
     double dailyPnlTicks_ = 0.0;   // realised, per lot, current trading day
     char dailyDay_[kDateLen] = {0};
     bool dailyHalted_ = false;
@@ -455,7 +454,23 @@ private:
     // Format: "HH:MM-HH:MM[,HH:MM-HH:MM]", a window may cross midnight.
     // Empty = 24 h (old behaviour).
     std::vector<std::pair<int, int>> sessions_;   // seconds of day, [from, to)
+    bool sessionsRequired_ = false;               // live mode fails closed without a valid window
     bool inSession(const TickMsg& tick) const;
+    // Entry-gate telemetry. An idle strategy that prints nothing is
+    // indistinguishable from a broken one: on 2026-11-11 the day session sent
+    // zero orders for six hours and every log line looked healthy, because the
+    // session gate returns before any signal is evaluated. These counters make
+    // the reason explicit, rate limited to one line per minute (the hot path
+    // only increments a uint64_t).
+    uint64_t gateTicks_ = 0;      // ticks that reached evaluate()
+    uint64_t gateSession_ = 0;    // dropped: outside every trade_sessions window
+    uint64_t gateBlackout_ = 0;   // dropped: inside a window, but past the entry cutoff
+    uint64_t gateHalt_ = 0;       // dropped: daily loss circuit breaker fired
+    uint64_t gateSpread_ = 0;     // dropped: spread wider than max_spread_ticks
+    int64_t lastGateLogNs_ = 0;
+    bool firstTickLogged_ = false;
+    void logGateReport(int64_t now, const TickMsg& tick);
+    void logFirstTick(const TickMsg& tick);
     // true when the tick sits inside an entry window but within
     // entry_blackout_sec of that window's END (no new entries there).
     bool nearSessionEnd(const TickMsg& tick) const;
