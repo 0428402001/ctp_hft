@@ -6,7 +6,7 @@ rem  Uses the build\bin_simnow flavour (compiled against the standard CTP SDK)
 rem  and config\config_simnow.ini by default.
 rem
 rem  Usage:  start_simnow.bat                               (config_simnow.ini)
-rem          start_simnow.bat config\config_simnow_demo.ini (faster signals)
+
 rem          start_simnow.bat config\my_simnow.ini          (any config file)
 rem ============================================================================
 setlocal

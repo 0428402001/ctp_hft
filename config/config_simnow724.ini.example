@@ -88,12 +88,12 @@ name = obi_voi
 ; ---------------------------------------------------------------------------
 
 ; ---------------------------------------------------------------------------
-;  Entry windows. Backtest on 131 783 recorded ticks (2026-11-05/06, incl. cost):
-;    night 21:00-02:30  68 trips  +281 tick  +4.13/trip  62 % win
-;    day   09:00-15:00  28 trips  -137 tick  -4.89/trip  22 % win
-;  The fade only pays in the night session; the day session is where the
-;  trend days live. Outside the windows nothing is opened (exits still run).
-trade_sessions     = 21:00-02:30
+;  Entry windows. EMPTY = no restriction: entries are allowed around the clock.
+;  Set one or more windows, e.g. "21:00-02:30" or "21:00-02:30,09:00-10:15",
+;  to trade only then; exits are never gated either way. The night-only window
+;  came from a 1.5-day sample (night +4.13 / day -4.89 tick per trip) - too
+;  small to trust, so the default runs 24 h and keeps collecting samples.
+trade_sessions     =
 window_ticks       = 10      ; 16 -> 10: the stall filter below now covers the
                               ;   short horizon, so the OBI window can react faster
 obi_threshold      = 0.90    ; 0.92 -> 0.90 together with window 16 -> 10: the
@@ -162,7 +162,7 @@ entry_blackout_sec = 1800
 ; resets when the exchange trading day rolls.
 daily_loss_limit_ticks = 35
 ; Historical sample deviations are logged as warnings; they are not global
-; startup gates. Live trading fails closed when no valid trade_sessions exist.
+; startup gates. No trade_sessions configured simply means entries 24 h.
 consec_stop_pause  = 3      ; after 3 losing round trips in a row, stop looking for
                             ;   entries for pause_seconds. A fade bleeds in a trend;
                             ;   2026-11-06 11:02-11:04 three shorts stopped -5/-6/-6

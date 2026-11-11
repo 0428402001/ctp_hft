@@ -452,9 +452,11 @@ private:
     // therefore restricted to the windows listed here; exits are never gated
     // (a position must always be closable).
     // Format: "HH:MM-HH:MM[,HH:MM-HH:MM]", a window may cross midnight.
-    // Empty = 24 h (old behaviour).
+    // Empty = no restriction at all (24 h), which is the default since
+    // 2026-11-11: the operator asked for the whole trading day to be tradable,
+    // and a silently-swallowed window turned the day session into six hours of
+    // zero orders. An unset window is now a conscious "trade 24 h" choice.
     std::vector<std::pair<int, int>> sessions_;   // seconds of day, [from, to)
-    bool sessionsRequired_ = false;               // live mode fails closed without a valid window
     bool inSession(const TickMsg& tick) const;
     // Entry-gate telemetry. An idle strategy that prints nothing is
     // indistinguishable from a broken one: on 2026-11-11 the day session sent

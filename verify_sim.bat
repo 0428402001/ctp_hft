@@ -1,9 +1,9 @@
 @echo off
-rem  Temporary harness: simulation-only end-to-end check (no broker, no network).
+rem  Simulation-only end-to-end check (no broker, no network): config\config.ini.
 rem  Proves signal -> order -> fill -> bracket exit -> round trip in one run.
 setlocal
 cd /d "%~dp0"
-set CFG=config\config_simfill.ini
+set CFG=config\config.ini
 set BIN=build\bin
 
 "%BIN%\shm_reset.exe" >nul 2>&1

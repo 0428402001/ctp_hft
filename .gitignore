@@ -21,12 +21,8 @@ flow/
 # commit config/*.ini.example instead (see README section 5).
 # ---------------------------------------------------------------
 config/config.ini
-config/config_live.ini
 config/config_simnow.ini
 config/config_simnow724.ini
-config/config_simnow_demo.ini
-config/config_verify.ini
-config/config_simfill.ini
 
 # local sync bundles handed to the live box
 _pack/

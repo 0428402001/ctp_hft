@@ -135,7 +135,7 @@ ctp_hft/
 ├── build_mingw.bat         MinGW 一键编译（mini + std 双风味全量构建）
 ├── build_strategy.bat      只重编策略进程（改策略后最快上线路径）
 ├── start_sim.bat           四进程仿真（无需账号）
-├── start_live.bat          CTP Mini 实盘
+├── verify_sim.bat          离线链路自测（sim 模式，5 秒内出回合后自动退出）
 ├── start_simnow.bat        SimNow 白天启动器（guard.py --env day 的包装，见第 6 节）
 ├── start_simnow724.bat     SimNow 7×24 启动器（guard.py --env 724 的包装）
 ├── start_simnow_raw.bat    旧的直启逻辑（仅存档，运行中勿碰：会 shm_reset 清总线）
@@ -144,11 +144,9 @@ ctp_hft/
 ├── monitor.bat             实时状态面板
 ├── stop_all.bat            彻底停止（挂 flow\.halt，守护不再自启；--daemon 连守护也停）
 ├── config/
-│   ├── config.ini          默认配置（仿真模式）
-│   ├── config_live.ini     CTP Mini 实盘模板
-│   ├── config_simnow.ini   SimNow 第一套环境（30001/30011，09:00-16:00）
-│   ├── config_simnow_demo.ini  SimNow 快信号演示参数
-│   └── config_simnow724.ini   SimNow 7×24 环境（40001/40011，16:00 后）
+│   ├── config.ini          离线仿真（mode=sim，无柜台无网络，自测用）
+│   ├── config_simnow.ini   SimNow 第一套环境（30001/30011）
+│   └── config_simnow724.ini   SimNow 7×24 环境（40001/40011）
 ├── tools/                  运维与诊断（Python / PowerShell，不进主构建）
 │   ├── guard.py            环境判定 + 看活 + 限流闸门（交互/自动化入口）
 │   ├── guard_daemon.py     常驻守护（计划任务 ctp_hft_daemon 拉起的唯一进程）
@@ -270,19 +268,19 @@ objdump -p build\bin\md_proc.exe | findstr "DLL Name"
 > `user_id / password / investor_id`。真实的 `config/config*.ini` 已被 `.gitignore` 排除，
 > 不会误提交。
 
-现成的四套配置：
+现成的三套配置：
 
-| 文件 | 前置 | 开仓时段 | 用途 |
-|---|---|---|---|
-| `config_simnow.ini` | 30001/30011（交易时段） | `21:00-02:30` | 生产（夜盘） |
-| `config_simnow724.ini` | 40001/40011（16:00-09:00） | `21:00-02:30` | 生产（7×24 环境） |
-| `config_verify.ini` | 40001/40011 | `00:00-23:59` | **验证链路，不追求盈利** |
-| `config.ini` | 无（仿真） | 不限制 | 本地仿真 |
+| 文件 | 前置 | 用途 |
+|---|---|---|
+| `config.ini` | 无（`mode = sim`） | 离线仿真自测，`verify_sim.bat` 用 |
+| `config_simnow.ini` | 30001/30011（交易时段） | SimNow 第一套环境 |
+| `config_simnow724.ini` | 40001/40011（16:00-09:00） | SimNow 7×24 环境 |
 
-`config_verify.ini` 是为了回答"这套东西到底能不能下单"：obi 门槛 0.85、tp10/sl6、
-日亏损上限 120 tick、全时段可开仓。跑它能在几分钟内看到完整的
-`SIGNAL -> ORDER -> TRADE -> ROUND TRIP`，用来排除"没信号"和"链路断了"的混淆。
-纯仿真下用 `verify_sim.bat`（不需要柜台和网络）验证同一件事。
+**三套配置都不限制交易时段**：`trade_sessions` 留空表示全天可开仓（2026-11-11 起）。
+需要限制时写 `21:00-02:30` 或 `21:00-02:30,09:00-10:15`，只挡开仓，平仓永不受限。
+
+想验证"这套东西到底能不能下单"，不用另建配置：`verify_sim.bat` 用 `config.ini`
+在纯仿真下 5 秒内跑出 `SIGNAL -> ORDER -> TRADE -> ROUND TRIP`，不需要柜台和网络。
 
 ```ini
 [account]
@@ -319,8 +317,9 @@ name = obi_voi
 
 [obi_voi]
 ; ---- 时段闸门 ----
-trade_sessions      = 21:00-02:30  ; 只在这些窗口内开新仓（逗号可分隔多段），其余时间只平仓
-                                   ; 依据：13.18 万 tick 回放，夜盘 +4.13 tick/笔、日盘 −4.89 tick/笔
+trade_sessions      =              ; 留空 = 全天可开仓（当前默认）
+                                   ; 要限制就写 21:00-02:30 或 21:00-02:30,09:00-10:15，
+                                   ; 只挡开仓，平仓永不受限
 
 ; ---- 信号 ----
 window_ticks        = 10    ; OBI 极端判定回看窗口（tick，上限 32 = obiRing 容量）
@@ -620,10 +619,11 @@ obi_voi: mode=fade window=10 obiTh=0.90 voiEma=5 voiFlip=0.35 voiEntry=0.10 |
 entryTimeout=4t entrySlip=1t taker=ioc profit=16t closeTimeout=6t stopLoss=8t stopSlip=2t
 maxHold=0t tpRepost=0/20t maxSpread=1t trend=30000ms/1t vol=1 maxPos=1 short=yes |
 maxHoldSec=600 escapeRetry=800ms consecStop=3/180s
-obi_voi: entry windows = 21:00-02:30 (everything else: exits only)
+obi_voi: no trade_sessions configured -> entries allowed 24 h (set e.g. 21:00-02:30 to restrict)
 ```
 
-第二行是时段闸门：窗口外收到信号只记日志不下单（白天已实测 0 信号）。
+最后一行是时段闸门。现在默认没有窗口（全天可开仓）；一旦配了窗口（如 `21:00-02:30`），
+窗口外收到信号只记日志不下单。
 
 ### 7.4 2026-11-06 的实测与结论
 
@@ -709,13 +709,13 @@ tp8/sl6），模拟给出 −4.90 tick/笔，实盘实测 −1.65 tick/笔（同
 
 由这条推导出的运行建议：
 
-- **配置审计**：`max_spread_ticks`、时段和止盈参数偏离历史样本时记录告警，不再将单一合约的
-  回测结果当作启动硬门槛。实盘没有有效 `trade_sessions` 时策略会 fail-closed，禁止新开仓；
-  平仓和风险管理仍运行。逐 tick 研究日志默认关闭，可用 `[general] debug_logging=true` 开启。
+- **配置审计**：`max_spread_ticks`、止盈参数偏离历史样本时记录告警，不再将单一合约的
+  回测结果当作启动硬门槛。`trade_sessions` 留空即全天开仓，不再是隐性开关；
+  平仓和风险管理始终运行。逐 tick 研究日志默认关闭，可用 `[general] debug_logging=true` 开启。
 - **日亏损熔断**：`daily_loss_limit_ticks=35`。按交易所交易日累计，夜盘与其后的日盘共用
-  一个预算；达到后不再开新仓，持仓继续按括号单退出。实盘未配置有效上限时新开仓会被禁用。
+  一个预算；达到后不再开新仓，持仓继续按括号单退出。设成 0 时只告警、不拦截。
 - **收盘前开仓保护**：`entry_blackout_sec=1800`。仅对已配置的 `trade_sessions` 生效，窗口结束前
-  30 分钟禁止新开仓。实盘若未配置至少 300 秒缓冲，也会禁止新开仓。
+  30 分钟禁止新开仓；没有配置窗口时这条自然不生效。
 
 ### 7.7 2026-11-11：整天零委托，不是策略不工作，是闸门太安静
 
@@ -734,6 +734,10 @@ tp8/sl6），模拟给出 −4.90 tick/笔，实盘实测 −1.65 tick/笔（同
 `if (!inSession(tick)) return;` 就返回了，**在此之前不打印任何东西**。于是"配置决定不开仓"
 和"策略坏了"在日志上完全同形。
 
+**修复（2026-11-11 收尾）**：`trade_sessions` 留空 = 全天可开仓，这是三套配置现在的默认值
+（原来空值在 live 模式会 fail-closed，已删除该逻辑）。想限制时段仍可写窗口，只是不再是
+隐性开关。
+
 **修复（可观测性，不改交易逻辑）**：
 
 - 第一笔 tick 打印当前墙钟是否在窗口内，以及距离下一个窗口多久：
@@ -751,9 +755,9 @@ tp8/sl6），模拟给出 −4.90 tick/笔，实盘实测 −1.65 tick/笔（同
 一笔就吃掉当日全部。这是 SimNow 行情源在夜盘收尾的跳变，不是止损逻辑的问题（跳空时任何
 触发都追不回来），但说明**统计盈亏必须剔除单笔 >20 tick 的离群值**，否则一天的数字全是噪音。
 
-**验证配置**：`config_verify.ini`（对应 `build\bin_simnow`）。全时段可开仓、obi 0.85、
-tp10/sl6、日亏损上限 120 tick，专用于"证明链路通"而不是赚钱。跑 `verify_sim.bat`
-可以在纯仿真下 5 秒内看到 `SIGNAL -> ORDER -> TRADE -> ROUND TRIP` 全链路。
+**验证**：`verify_sim.bat` 用 `config.ini`（`mode = sim`，无柜台无网络）跑
+`SIGNAL -> ORDER -> TRADE -> ROUND TRIP`，5 秒内出结果。要验证真实柜台链路，
+直接用 `config_simnow724.ini` 起四个进程——它现在也是全天可开仓。
 
 **没做、也不建议做的**：
 

@@ -1,6 +1,8 @@
 ; ============================================================================
-;  ctp_hft - configuration
-;  All four processes (md / strategy / trader / query) read this single file.
+;  ctp_hft - offline simulation config (mode = sim, no broker, no network)
+;  This is the ONLY self-test config: verify_sim.bat uses it to prove
+;  signal -> order -> fill -> bracket exit -> round trip in a few seconds.
+;  Production/live testing uses config_simnow.ini or config_simnow724.ini.
 ;  Lines starting with ';' or '#' are comments.
 ; ============================================================================
 
@@ -17,21 +19,18 @@ auth_code  = 0000000000000000
 product_info = ctp_hft
 
 [md]
-; market data front, e.g. tcp://180.168.146.187:10211
-front      = tcp://182.254.243.31:40011
-; optional extra fronts (comma separated)
+; mode = sim never connects; only mode = live reads these fronts
+front      =
 fronts     =
 flow_path  = ./flow/md
 
 [trader]
-; trading front, e.g. tcp://180.168.146.187:10201
-front      = tcp://1182.254.243.31:40001
+front      =
 fronts     =
 flow_path  = ./flow/trader
 
 [query]
-; the query process uses its own session; by default it shares the trade front
-front      = tcp://182.254.243.31:40011
+front      =
 fronts     =
 flow_path  = ./flow/query
 ; how often account / positions / instruments are refreshed (milliseconds)
@@ -45,6 +44,8 @@ log_dir     = ./log
 ; contracts the strategy trades (comma separated)
 instruments = ag2612
 heartbeat_ms = 500
+; Enable only when collecting detailed tick-by-tick research logs.
+debug_logging = false
 ; ---- latency tuning (see process_app.cpp applyPerformanceSettings) ------
 ; hybrid idle wait: tight _mm_pause spin for spin_us, then SwitchToThread
 ; for another spin_us, only then sleep (1 ms granularity, see timeBeginPeriod)
@@ -81,7 +82,9 @@ partial_fills     = true
 name = obi_voi
 
 [obi_voi]
-entry_mode         = maker   ; quote the touch on the side of the last print (spread capture)
+; Aggressive settings on purpose: the point of this file is to produce a fill
+; within seconds, not to make money. Do NOT copy these to a live config.
+entry_mode         = fade
 ; ---------------------------------------------------------------------------
 ;  L1 order book imbalance fade strategy
 ;  OBI  = (bidVol1 - askVol1) / (bidVol1 + askVol1)
@@ -94,17 +97,15 @@ entry_mode         = maker   ; quote the touch on the side of the last print (sp
 ;        close_timeout_ticks without a fill -> IOC limit at the opponent price
 ;  inventory: net capped at max_position, at the cap closes only
 ; ---------------------------------------------------------------------------
-window_ticks       = 12
-obi_threshold      = 0.8
+window_ticks       = 8
+obi_threshold      = 0.70
 voi_ema_ticks      = 5
 voi_flip_threshold = 0.4
-entry_timeout_ticks = 30
+entry_timeout_ticks = 4
 entry_slippage_ticks = 0    ; entry crosses 1 tick toward the opponent (buy bid1+1 capped at ask1 / sell ask1-1 capped at bid1) so it fills promptly
-profit_ticks         = 8    ; passive close rests at entry +/- N ticks (fade captures mean reversion)
+profit_ticks       = 6
 close_timeout_ticks = 3
-stop_loss_ticks    = 6     ; price stop: 6 ticks against entry -> cancel TP, IOC stop
-entry_blackout_sec = 1800  ; no new entries in the last 30 minutes of a configured session
-daily_loss_limit_ticks = 35 ; daily realized-loss cap in ticks per lot
+stop_loss_ticks    = 4
 max_hold_ticks     = 60
 trade_volume       = 1
 max_position       = 1
@@ -112,3 +113,10 @@ cooldown_ticks     = 4
 allow_short        = true
 flatten_on_start   = true
 close_on_stop      = true
+entry_taker        = 1
+max_spread_ticks   = 3
+entry_stall_ticks  = 0
+entry_blackout_sec = 300
+daily_loss_limit_ticks = 200
+max_hold_seconds   = 120
+consec_stop_pause  = 99

@@ -47,7 +47,6 @@ const char* ObiVoiStrategy::phaseName(Phase p) {
 
 bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& err) {
     ctx_ = &ctx;
-    sessionsRequired_ = !ctx.simulationMode();
 
     instruments_ = cfg.instruments();
     windowTicks_ = cfg.getInt("obi_voi", "window_ticks", 10);
@@ -106,14 +105,13 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
             pos = comma + 1;
         }
         if (sessions_.empty()) {
-            if (sessionsRequired_) {
-                HFT_LOGE("obi_voi: trade_sessions='%s' parsed to nothing; live entries fail closed",
-                         sess.c_str());
-            } else {
-                HFT_LOGW("obi_voi: trade_sessions='%s' parsed to nothing; simulation allows all day",
-                         sess.c_str());
-            }
+            HFT_LOGW("obi_voi: trade_sessions='%s' parsed to nothing; no window set, "
+                     "entries are allowed 24 h", sess.c_str());
         }
+    }
+    if (sessions_.empty()) {
+        HFT_LOGI("obi_voi: no trade_sessions configured -> entries allowed 24 h "
+                 "(set e.g. 21:00-02:30 to restrict)");
     }
     tradeVolume_ = cfg.getInt("obi_voi", "trade_volume", 1);
     maxPosition_ = cfg.getInt("obi_voi", "max_position", 1);
@@ -198,21 +196,13 @@ bool ObiVoiStrategy::auditConfig(std::string& err) const {
     // These empirical values came from a narrow instrument/sample and are
     // diagnostics, not universal safety invariants. In particular, do not
     // terminate the process because a sim or another instrument uses different
-    // settings. Live mode instead fails closed at the entry gate when no valid
-    // session has been configured.
+    // settings. A missing trade_sessions window is not an error either: it
+    // means "trade the whole day", which is the default configuration.
     if (sessions_.empty()) {
-        if (sessionsRequired_) {
-            HFT_LOGE("obi_voi: live mode has no valid trade_sessions; new entries are disabled");
-        } else {
-            HFT_LOGW("obi_voi: no trade_sessions configured; simulation permits entries all day");
-        }
+        HFT_LOGI("obi_voi: session gate disabled (no trade_sessions) - entries all day");
     }
-    if (sessionsRequired_ && dailyLossLimitTicks_ <= 0) {
-        HFT_LOGE("obi_voi: live mode has no daily loss limit; new entries are disabled");
-    }
-    if (sessionsRequired_ && entryBlackoutSec_ < 300) {
-        HFT_LOGE("obi_voi: live mode requires at least 300 s entry blackout before session end; "
-                 "new entries are disabled");
+    if (dailyLossLimitTicks_ <= 0) {
+        HFT_LOGW("obi_voi: daily_loss_limit_ticks=0 - a runaway day is not bounded");
     }
     if (maxSpreadTicks_ == 0)
         HFT_LOGW("obi_voi: max_spread_ticks=0 disables the spread filter");
@@ -647,7 +637,7 @@ void ObiVoiStrategy::reconcileBook(State& st, const TickMsg& tick) {
 //  a malformed field would be worse than trading the full day.
 // ---------------------------------------------------------------------------
 bool ObiVoiStrategy::inSession(const TickMsg& tick) const {
-    if (sessions_.empty()) return !sessionsRequired_;
+    if (sessions_.empty()) return true;   // no window configured = trade 24 h
     int h = 0, m = 0, s = 0;
     if (std::sscanf(tick.updateTime, "%d:%d:%d", &h, &m, &s) != 3 ||
         h < 0 || h > 23 || m < 0 || m > 59 || s < 0 || s > 59) return false;
@@ -753,15 +743,12 @@ void ObiVoiStrategy::evaluate(State& st, const TickMsg& tick) {
     if (st.obiCount < static_cast<uint32_t>(windowTicks_)) return;  // warm-up
     if (st.cooldownTicks > 0) return;
 
-    // ---- session gate: only hunt for entries inside the profitable windows --
+    // ---- session gate: open when no window is configured (default), else only
+    // inside the configured windows ------------------------------------------
     if (!inSession(tick)) { ++gateSession_; return; }
-    // Live trading must have a finite loss budget and enough time to manage a
-    // position before the configured session closes. The 2026-11-10 order
-    // report showed a late entry at 14:59 and a close rejected after 15:00.
-    if (sessionsRequired_ &&
-        (dailyLossLimitTicks_ <= 0 || entryBlackoutSec_ < 300)) return;
     // ... and not in the last minutes of one: a position opened there cannot
     // be closed before the exchange shuts (2026-11-10 14:59:15 entry).
+    // No window -> no cutoff, because there is no close to protect against.
     if (nearSessionEnd(tick)) { ++gateBlackout_; return; }
 
     // ---- daily loss circuit breaker -----------------------------------------
