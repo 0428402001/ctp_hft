@@ -27,7 +27,11 @@ constexpr uint32_t kMagicCmd = 0x434D'4444u;       // "CMDD"
 constexpr uint32_t kMagicExec = 0x4558'4543u;      // "EXEC"
 constexpr uint32_t kMagicQryReq = 0x5152'4551u;    // "QREQ"
 constexpr uint32_t kMagicQryRsp = 0x5152'5350u;    // "QRSP"
-constexpr uint32_t kMagicShm = 0x4846'5453u;       // "HFTS"
+constexpr uint32_t kMagicShm = 0x4846'5432u;       // "HFT2" shared-memory ABI v2
+
+constexpr uint32_t kFaultTickQueueOverflow = 1u << 0;
+constexpr uint32_t kFaultExecQueueOverflow = 1u << 1;
+constexpr uint32_t kFaultExecMirrorOverflow = 1u << 2;
 
 // ---- role ids -------------------------------------------------------------
 enum class Role : uint32_t { Md = 0, Strategy = 1, Trader = 2, Query = 3 };
@@ -319,7 +323,8 @@ struct SnapshotBlock {
 
 // ---------------------------------------------------------------------------
 // Market snapshot: written by the market-data process, read by everyone else.
-// Plain doubles on naturally aligned offsets => tear free on x64, no locking.
+// Mutable fields are atomic and grouped by a sequence counter so each reader
+// gets one coherent tick without a process-shared mutex or C++ data race.
 // ---------------------------------------------------------------------------
 constexpr uint32_t kMaxMarketInstruments = 256;
 
@@ -337,9 +342,77 @@ struct MarketTickSnap {
     int64_t recvTimeNs;
 };
 
+struct MarketSnapshotItem {
+    // Instrument is immutable after the item is published through count.
+    char instrument[kInstrumentLen]{};
+    std::atomic<uint32_t> seq{0};
+    std::atomic<double> lastPrice{0.0};
+    std::atomic<double> bidPrice1{0.0};
+    std::atomic<double> askPrice1{0.0};
+    std::atomic<double> openPrice{0.0};
+    std::atomic<double> highestPrice{0.0};
+    std::atomic<double> lowestPrice{0.0};
+    std::atomic<int32_t> bidVolume1{0};
+    std::atomic<int32_t> askVolume1{0};
+    std::atomic<int64_t> tickTimeNs{0};
+    std::atomic<int64_t> recvTimeNs{0};
+
+    void setInstrument(const char* name) { copyStr(instrument, name); }
+
+    void publish(const MarketTickSnap& value) {
+        seq.fetch_add(1u, std::memory_order_acq_rel);  // odd = writer active
+        lastPrice.store(value.lastPrice, std::memory_order_relaxed);
+        bidPrice1.store(value.bidPrice1, std::memory_order_relaxed);
+        askPrice1.store(value.askPrice1, std::memory_order_relaxed);
+        openPrice.store(value.openPrice, std::memory_order_relaxed);
+        highestPrice.store(value.highestPrice, std::memory_order_relaxed);
+        lowestPrice.store(value.lowestPrice, std::memory_order_relaxed);
+        bidVolume1.store(value.bidVolume1, std::memory_order_relaxed);
+        askVolume1.store(value.askVolume1, std::memory_order_relaxed);
+        tickTimeNs.store(value.tickTimeNs, std::memory_order_relaxed);
+        recvTimeNs.store(value.recvTimeNs, std::memory_order_relaxed);
+        seq.fetch_add(1u, std::memory_order_release);  // even = stable
+    }
+
+    bool read(MarketTickSnap& out) const {
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            const uint32_t before = seq.load(std::memory_order_acquire);
+            if (before & 1u) continue;
+            std::memcpy(out.instrument, instrument, sizeof(instrument));
+            out.lastPrice = lastPrice.load(std::memory_order_relaxed);
+            out.bidPrice1 = bidPrice1.load(std::memory_order_relaxed);
+            out.askPrice1 = askPrice1.load(std::memory_order_relaxed);
+            out.openPrice = openPrice.load(std::memory_order_relaxed);
+            out.highestPrice = highestPrice.load(std::memory_order_relaxed);
+            out.lowestPrice = lowestPrice.load(std::memory_order_relaxed);
+            out.bidVolume1 = bidVolume1.load(std::memory_order_relaxed);
+            out.askVolume1 = askVolume1.load(std::memory_order_relaxed);
+            out.tickTimeNs = tickTimeNs.load(std::memory_order_relaxed);
+            out.recvTimeNs = recvTimeNs.load(std::memory_order_relaxed);
+            const uint32_t after = seq.load(std::memory_order_acquire);
+            if (before == after && !(after & 1u)) return true;
+        }
+        return false;
+    }
+};
+
 struct MarketSnapshotBlock {
     std::atomic<uint32_t> count{0};
-    MarketTickSnap items[kMaxMarketInstruments];
+    MarketSnapshotItem items[kMaxMarketInstruments];
+
+    bool read(uint32_t index, MarketTickSnap& out) const {
+        const uint32_t n = count.load(std::memory_order_acquire);
+        return index < n && index < kMaxMarketInstruments && items[index].read(out);
+    }
+
+    bool find(const char* name, MarketTickSnap& out) const {
+        const uint32_t n = count.load(std::memory_order_acquire);
+        for (uint32_t i = 0; i < n && i < kMaxMarketInstruments; ++i) {
+            if (std::strncmp(items[i].instrument, name, kInstrumentLen) == 0 &&
+                items[i].read(out)) return true;
+        }
+        return false;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -361,6 +434,9 @@ struct ControlBlock {
     std::atomic<uint32_t> mdLoggedIn{0};
     std::atomic<uint32_t> traderLoggedIn{0};
     std::atomic<uint32_t> queryLoggedIn{0};
+    // Latched until a cold restart: data loss invalidates strategy state and
+    // therefore disables new risk until an operator reconciles the account.
+    std::atomic<uint32_t> dataFaults{0};
     Heartbeat hb[4];
 };
 

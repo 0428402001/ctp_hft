@@ -64,6 +64,8 @@ int main(int argc, char** argv) {
         std::printf("ctp_hft monitor                       %s\n", hft::localTimeString().c_str());
         std::printf("mode: %s   shutdown=%u  trading=%s\n", cfg.mode().c_str(),
                     ctl->shutdown.load(), ctl->tradingEnabled.load() ? "ON" : "OFF");
+        std::printf("data-integrity faults: 0x%X (latched until cold restart)\n",
+                    ctl->dataFaults.load(std::memory_order_acquire));
 
         hr("processes");
         std::printf("%-9s %-8s %-14s %-10s\n", "ROLE", "PID", "LAST BEAT", "BEATS");
@@ -138,7 +140,8 @@ int main(int argc, char** argv) {
         const uint32_t n = mkt->count.load(std::memory_order_acquire);
         std::printf("%-14s %12s %12s %12s\n", "INSTRUMENT", "LAST", "BID", "ASK");
         for (uint32_t i = 0; i < n && i < hft::kMaxMarketInstruments; ++i) {
-            const hft::MarketTickSnap& s = mkt->items[i];
+            hft::MarketTickSnap s{};
+            if (!mkt->read(i, s)) continue;
             std::printf("%-14s %12.2f %12.2f %12.2f\n", s.instrument, s.lastPrice, s.bidPrice1,
                         s.askPrice1);
         }

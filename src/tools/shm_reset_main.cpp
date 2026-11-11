@@ -55,11 +55,21 @@ int main() {
     total += wipe(qryRsp, kShmQryRsp);
     total += wipe(snapshot, kShmSnapshot);
 
+    // wipe() zeroes the control block like every other region. Restore the ABI
+    // marker so new processes can reject stale layouts before touching queues.
+    if (!control.openOrCreate(kShmControl)) {
+        std::fprintf(stderr, "shm_reset: cannot reopen control block: %s\n",
+                     control.lastError().c_str());
+        return 1;
+    }
+    control->magic.store(kMagicShm, std::memory_order_release);
+    control.close();
+
     if (total == 0) {
         std::fprintf(stderr, "shm_reset: no shared-memory section could be reset\n");
         return 1;
     }
-    std::printf("shm_reset: 9 shared sections wiped (%.1f MB) - bus is clean\n",
+    std::printf("shm_reset: 9 shared sections wiped (%.1f MB), ABI v2 - bus is clean\n",
                 static_cast<double>(total) / 1024.0 / 1024.0);
     return 0;
 }

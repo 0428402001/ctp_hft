@@ -20,6 +20,13 @@ inline int64_t nowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count();
 }
 
+// Monotonic timestamp with a host-wide steady-clock epoch. Use this for fields
+// exchanged between processes; nowNs() deliberately has a process-local origin.
+inline int64_t monotonicNowNs() {
+    auto d = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(d).count();
+}
+
 // Absolute wall clock nanoseconds (epoch based). Comparable *across*
 // processes - this is what must be used for cross-process latency accounting,
 // while nowNs() (per process monotonic) is for local timeouts.

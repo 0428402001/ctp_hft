@@ -141,6 +141,12 @@ protected:
         handles.push_back(channels().qryReqEvt().handle());
     }
 
+    bool prepareWait() override {
+        bool ready = channels().prepareExecsToQueryWait();
+        ready = channels().prepareQryReqWait() && ready;
+        return ready;
+    }
+
 private:
     // ---- instrument table --------------------------------------------------
     void initInstruments() {
@@ -262,8 +268,10 @@ private:
         for (auto& p : book_) {
             double last = 0.0;
             for (uint32_t i = 0; i < n && i < kMaxMarketInstruments; ++i) {
-                if (std::strncmp(mkt->items[i].instrument, p.instrument, kInstrumentLen) == 0) {
-                    last = mkt->items[i].lastPrice;
+                MarketTickSnap snap{};
+                if (mkt->read(i, snap) &&
+                    std::strncmp(snap.instrument, p.instrument, kInstrumentLen) == 0) {
+                    last = snap.lastPrice;
                     break;
                 }
             }

@@ -161,7 +161,9 @@ bool ProcessApp::parseArgs(int argc, char** argv, std::string& err) {
     if (logDir.empty()) logDir = cfg_.logDir();
 
     Logger::instance().init(logDir, name_, consoleLog_);
-    Logger::instance().setLevel(LogLevel::Debug);
+    Logger::instance().setLevel(cfg_.getBool("general", "debug_logging", false)
+                                     ? LogLevel::Debug
+                                     : LogLevel::Info);
     return true;
 }
 
@@ -181,6 +183,11 @@ bool ProcessApp::init(int argc, char** argv) {
     }
     if (!control()) {
         HFT_LOGE("control block not available");
+        return false;
+    }
+
+    if (control()->magic.load(std::memory_order_acquire) != kMagicShm) {
+        HFT_LOGE("shared-memory ABI mismatch; stop every process and run shm_reset before restart");
         return false;
     }
 
@@ -303,6 +310,10 @@ int ProcessApp::run() {
         }
         const bool active = onPoll();
         if (active) {
+            idle = false;
+            continue;
+        }
+        if (!prepareWait()) {
             idle = false;
             continue;
         }

@@ -116,6 +116,8 @@ protected:
         handles.push_back(channels().commandsEvt().handle());
     }
 
+    bool prepareWait() override { return channels().prepareCommandsWait(); }
+
 private:
     void handleCommand(const OrderCommand& cmd) {
         if (cmd.magic != kMagicCmd) {
@@ -183,13 +185,19 @@ private:
     void publishExec(const ExecReport& r) {
         if (!channels().pushExec(r)) {
             ++execDropped_;
+            control()->dataFaults.fetch_or(kFaultExecQueueOverflow, std::memory_order_release);
+            control()->tradingEnabled.store(0, std::memory_order_release);
             if (execDropped_ == 1 || (execDropped_ % 500) == 0) {
-                HFT_LOGW("exec ring full, dropped %llu reports",
+                HFT_LOGE("exec ring full, dropped %llu reports; new entries disabled",
                          static_cast<unsigned long long>(execDropped_));
             }
         }
         // Mirror to the query process (best effort - it is a bookkeeping feed).
-        channels().pushExecToQuery(r);
+        if (!channels().pushExecToQuery(r)) {
+            control()->dataFaults.fetch_or(kFaultExecMirrorOverflow, std::memory_order_release);
+            control()->tradingEnabled.store(0, std::memory_order_release);
+            HFT_LOGE("execution mirror ring full; query bookkeeping is incomplete");
+        }
         ++execCount_;
     }
 

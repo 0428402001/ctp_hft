@@ -30,6 +30,8 @@ class StrategyContext {
 public:
     virtual ~StrategyContext() = default;
 
+    virtual bool simulationMode() const = 0;
+
     // Returns the command id (>0) or 0 when the command ring is full.
     virtual uint32_t insert(const char* instrument, Dir direction, Offset offset, PriceType priceType,
                             double price, int volume, uint64_t tag) = 0;

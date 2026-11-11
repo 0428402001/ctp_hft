@@ -114,8 +114,10 @@ private:
     void publish(const TickMsg& t) {
         if (!channels().pushTick(t)) {
             ++dropped_;
+            control()->dataFaults.fetch_or(kFaultTickQueueOverflow, std::memory_order_release);
+            control()->tradingEnabled.store(0, std::memory_order_release);
             if (dropped_ == 1 || (dropped_ % 1000) == 0) {
-                HFT_LOGW("tick ring full, dropped %llu ticks in total",
+                HFT_LOGE("tick ring full, dropped %llu ticks; new entries disabled until restart",
                          static_cast<unsigned long long>(dropped_));
             }
         } else {
@@ -128,35 +130,27 @@ private:
         MarketSnapshotBlock* blk = channels().market();
         if (!blk) return;
         uint32_t n = blk->count.load(std::memory_order_acquire);
+        MarketTickSnap value{};
+        copyStr(value.instrument, t.instrument);
+        value.lastPrice = t.lastPrice;
+        value.bidPrice1 = t.bidPrice1;
+        value.askPrice1 = t.askPrice1;
+        value.openPrice = t.openPrice;
+        value.highestPrice = t.highestPrice;
+        value.lowestPrice = t.lowestPrice;
+        value.bidVolume1 = t.bidVolume1;
+        value.askVolume1 = t.askVolume1;
+        value.tickTimeNs = t.publishTimeNs;
+        value.recvTimeNs = t.recvTimeNs;
         for (uint32_t i = 0; i < n && i < kMaxMarketInstruments; ++i) {
             if (std::strncmp(blk->items[i].instrument, t.instrument, kInstrumentLen) == 0) {
-                blk->items[i].lastPrice = t.lastPrice;
-                blk->items[i].bidPrice1 = t.bidPrice1;
-                blk->items[i].askPrice1 = t.askPrice1;
-                blk->items[i].openPrice = t.openPrice;
-                blk->items[i].highestPrice = t.highestPrice;
-                blk->items[i].lowestPrice = t.lowestPrice;
-                blk->items[i].bidVolume1 = t.bidVolume1;
-                blk->items[i].askVolume1 = t.askVolume1;
-                blk->items[i].tickTimeNs = t.publishTimeNs;
-                blk->items[i].recvTimeNs = t.recvTimeNs;
+                blk->items[i].publish(value);
                 return;
             }
         }
         if (n < kMaxMarketInstruments) {
-            MarketTickSnap& s = blk->items[n];
-            std::memset(&s, 0, sizeof(s));
-            copyStr(s.instrument, t.instrument);
-            s.lastPrice = t.lastPrice;
-            s.bidPrice1 = t.bidPrice1;
-            s.askPrice1 = t.askPrice1;
-            s.openPrice = t.openPrice;
-            s.highestPrice = t.highestPrice;
-            s.lowestPrice = t.lowestPrice;
-            s.bidVolume1 = t.bidVolume1;
-            s.askVolume1 = t.askVolume1;
-            s.tickTimeNs = t.publishTimeNs;
-            s.recvTimeNs = t.recvTimeNs;
+            blk->items[n].setInstrument(t.instrument);
+            blk->items[n].publish(value);
             blk->count.store(n + 1, std::memory_order_release);
         }
     }

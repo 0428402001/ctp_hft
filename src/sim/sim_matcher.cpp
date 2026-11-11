@@ -8,16 +8,15 @@
 
 namespace hft {
 
-const MarketTickSnap* SimMatcher::findPrice(const MarketSnapshotBlock* market,
-                                            const char* instrument) const {
-    if (!market) return nullptr;
+bool SimMatcher::findPrice(const MarketSnapshotBlock* market, const char* instrument,
+                           MarketTickSnap& out) const {
+    if (!market) return false;
     const uint32_t n = market->count.load(std::memory_order_acquire);
     for (uint32_t i = 0; i < n && i < kMaxMarketInstruments; ++i) {
-        if (std::strncmp(market->items[i].instrument, instrument, kInstrumentLen) == 0) {
-            return &market->items[i];
-        }
+        if (std::strncmp(market->items[i].instrument, instrument, kInstrumentLen) == 0)
+            return market->read(i, out);
     }
-    return nullptr;
+    return false;
 }
 
 void SimMatcher::emitOrderRtn(const PendingOrder& o, char status, const char* msg,
@@ -88,8 +87,8 @@ void SimMatcher::submit(const OrderCommand& cmd, const MarketSnapshotBlock* mark
     std::snprintf(o.orderSysID, sizeof(o.orderSysID), "SIM%d", orderRefSeq_);
     ++orderRefSeq_;
 
-    const MarketTickSnap* px = findPrice(market, o.instrument);
-    if (!px || px->lastPrice <= 0) {
+    MarketTickSnap px{};
+    if (!findPrice(market, o.instrument, px) || px.lastPrice <= 0) {
         // No price yet: reject, exactly like a gateway would.
         o.active = false;
         orders_.push_back(o);
@@ -117,19 +116,19 @@ void SimMatcher::submit(const OrderCommand& cmd, const MarketSnapshotBlock* mark
     double fillPrice = 0;
     bool canFill = false;
     if (o.priceType == static_cast<char>(PriceType::Any)) {
-        fillPrice = isBuy ? px->askPrice1 : px->bidPrice1;
+        fillPrice = isBuy ? px.askPrice1 : px.bidPrice1;
         canFill = true;
     } else {
         // Limit order: crosses the spread => immediate fill at the touch.
-        if (isBuy && o.price >= px->askPrice1) {
-            fillPrice = px->askPrice1;
+        if (isBuy && o.price >= px.askPrice1) {
+            fillPrice = px.askPrice1;
             canFill = true;
-        } else if (!isBuy && o.price <= px->bidPrice1) {
-            fillPrice = px->bidPrice1;
+        } else if (!isBuy && o.price <= px.bidPrice1) {
+            fillPrice = px.bidPrice1;
             canFill = true;
         }
     }
-    if (fillPrice <= 0) fillPrice = px->lastPrice;
+    if (fillPrice <= 0) fillPrice = px.lastPrice;
 
     if (canFill && o.readyTimeNs <= nowNs()) {
         int qty = o.volume;
@@ -198,17 +197,17 @@ void SimMatcher::match(const MarketSnapshotBlock* market, std::vector<ExecReport
         if (!o.active) continue;
         if (now < o.readyTimeNs) continue;
 
-        const MarketTickSnap* px = findPrice(market, o.instrument);
-        if (!px) continue;
+        MarketTickSnap px{};
+        if (!findPrice(market, o.instrument, px)) continue;
 
         const bool isBuy = (o.direction == static_cast<char>(Dir::Buy));
         double fillPrice = 0;
         if (o.priceType == static_cast<char>(PriceType::Any)) {
-            fillPrice = isBuy ? px->askPrice1 : px->bidPrice1;
-        } else if (isBuy && o.price >= px->askPrice1) {
-            fillPrice = px->askPrice1;
-        } else if (!isBuy && o.price <= px->bidPrice1) {
-            fillPrice = px->bidPrice1;
+            fillPrice = isBuy ? px.askPrice1 : px.bidPrice1;
+        } else if (isBuy && o.price >= px.askPrice1) {
+            fillPrice = px.askPrice1;
+        } else if (!isBuy && o.price <= px.bidPrice1) {
+            fillPrice = px.bidPrice1;
         }
         if (fillPrice <= 0) continue;
 

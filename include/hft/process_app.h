@@ -67,10 +67,15 @@ protected:
     // ---- event-driven wake-up ------------------------------------------------
     // Each process lists the kernel events of its INBOUND channels here; the
     // idle path of run() blocks on them (WaitForMultipleObjects) instead of
-    // sleeping on a timer. Producers ring the doorbell on empty -> non-empty
-    // (see ChannelEvent). Default: no events -> plain timed sleep.
+    // sleeping on a timer. Producers claim a shared notification flag before
+    // ringing the doorbell (see ChannelEvent). Default: no events -> timed sleep.
     // Handles are collected once after onStart().
     virtual void collectWaitHandles(std::vector<void*>& handles) { (void)handles; }
+
+    // Called after onPoll reports no work and immediately before the idle wait.
+    // Queue consumers disarm their doorbells and recheck their queues here to
+    // close the producer/consumer lost-wakeup window.
+    virtual bool prepareWait() { return true; }
 
     // How long the idle path may block on the inbound events before polling
     // again anyway - the ONLY source of periodic wake-ups. Override with the

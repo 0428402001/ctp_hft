@@ -51,7 +51,8 @@ public:
     size_t pendingCount() const;
 
 private:
-    const MarketTickSnap* findPrice(const MarketSnapshotBlock* market, const char* instrument) const;
+    bool findPrice(const MarketSnapshotBlock* market, const char* instrument,
+                   MarketTickSnap& out) const;
     void emitOrderRtn(const PendingOrder& o, char status, const char* msg,
                       std::vector<ExecReport>& out) const;
     void emitTrade(const PendingOrder& o, double price, int volume, std::vector<ExecReport>& out) const;

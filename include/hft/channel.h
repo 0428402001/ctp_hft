@@ -55,19 +55,16 @@ constexpr const char* kShmMarket = "HFT_SHM_MARKET";
 // Kernel wake-up event attached to a queue channel.
 //
 // The rings themselves are wait-free and never block anyone. This event is the
-// optional "doorbell" on top: the producer SetEvent()s when the queue goes
-// empty -> non-empty, and the consumer can WaitForMultipleObjects() on its
-// inbound events instead of sleeping on a timer. Result: microsecond pickup
+// optional "doorbell" on top: the producer claims a shared notification flag
+// after publishing, and the consumer disarms it and rechecks the queue before
+// WaitForMultipleObjects(). This closes the lost-wakeup window while
+// coalescing a burst into one SetEvent. Result: prompt pickup
 // of new messages while burning ~0% CPU while idle (a poll loop that sleeps
 // in 1 ms ticks costs latency; one that spins costs a core; this costs
 // neither). POSIX builds degrade to plain polling (no-op stubs).
 //
 // Auto-reset semantics: one SetEvent() permits exactly one wait to return;
-// any leftover signal just causes one harmless spurious wakeup. The classic
-// lost-wakeup race (producer pushes while consumer is between "queue empty"
-// and "enter wait") is closed because the producer only skips SetEvent when
-// the queue was already non-empty at push time - and a non-empty queue means
-// the consumer will find the item on its next (or current) poll.
+// any leftover signal just causes one harmless spurious wakeup.
 // ---------------------------------------------------------------------------
 class ChannelEvent {
 public:
@@ -175,13 +172,12 @@ public:
     ChannelEvent& qryRspEvt() { return evtQryRsp_; }
 
     // ---- producer helpers: push + ring the doorbell -------------------------
-    // Push onto the queue and SetEvent only on the empty -> non-empty
-    // transition (so a busy consumer pays no syscall per message).
+    // Push and ring once until the consumer disarms the notification before
+    // sleeping; a busy consumer pays no syscall per message.
     template <typename Q>
     static bool pushNotify(Q& queue, ChannelEvent& evt, const typename Q::value_type& v) {
-        const bool wasEmpty = queue.empty();
         if (!queue.push(v)) return false;
-        if (wasEmpty) evt.notify();
+        if (queue.claimNotification()) evt.notify();
         return true;
     }
     bool pushTick(const TickMsg& v) { return pushNotify(*ticks_, evtTicks_, v); }
@@ -192,6 +188,13 @@ public:
     }
     bool pushQryReq(const QueryRequest& v) { return pushNotify(*qryReq_, evtQryReq_, v); }
     bool pushQryRsp(const QueryResponse& v) { return pushNotify(*qryRsp_, evtQryRsp_, v); }
+
+    bool prepareTicksWait() { return ticks_->prepareToWait(); }
+    bool prepareCommandsWait() { return commands_->prepareToWait(); }
+    bool prepareExecsWait() { return execs_->prepareToWait(); }
+    bool prepareExecsToQueryWait() { return execsToQuery_->prepareToWait(); }
+    bool prepareQryReqWait() { return qryReq_->prepareToWait(); }
+    bool prepareQryRspWait() { return qryRsp_->prepareToWait(); }
 
 private:
     template <typename Region>

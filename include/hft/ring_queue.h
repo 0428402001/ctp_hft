@@ -46,6 +46,22 @@ public:
         return true;
     }
 
+    // Producer side of the event-doorbell handshake. Only the first push after
+    // the consumer arms its wait needs to ring the kernel event.
+    bool claimNotification() {
+        return notificationArmed_.exchange(1u, std::memory_order_acq_rel) == 0u;
+    }
+
+    // Consumer side: disarm, then recheck the queue before blocking. The
+    // exchange pairs with a producer that already claimed the notification;
+    // that producer's queue publication is then visible to the empty() check.
+    // False means work arrived during the handoff and the caller should poll
+    // again instead of sleeping.
+    bool prepareToWait() {
+        notificationArmed_.exchange(0u, std::memory_order_acq_rel);
+        return empty();
+    }
+
     // ---- consumer side -----------------------------------------------------
 
     bool pop(T& out) {
@@ -104,6 +120,7 @@ public:
         pushed_.store(0, std::memory_order_relaxed);
         popped_.store(0, std::memory_order_relaxed);
         dropped_.store(0, std::memory_order_relaxed);
+        notificationArmed_.store(0u, std::memory_order_relaxed);
     }
 
 private:
@@ -115,6 +132,7 @@ private:
     // Consumer-owned cache line.
     alignas(HFT_CACHELINE) std::atomic<uint64_t> readIndex_{0};
     alignas(HFT_CACHELINE) std::atomic<uint64_t> popped_{0};
+    alignas(HFT_CACHELINE) std::atomic<uint32_t> notificationArmed_{0};
 
     // The payload itself, page aligned: the header above is padded out to a
     // full 4 KiB, so slot 0 lands exactly on a page boundary in the mapped

@@ -180,8 +180,8 @@ bool SimMarket::next(TickMsg& out) {
     out.volume = inst.volume;
     out.turnover = inst.turnover;
     out.openInterest = inst.openInterest;
-    out.recvTimeNs = wallNowNs();
-    out.publishTimeNs = wallNowNs();
+    out.recvTimeNs = monotonicNowNs();
+    out.publishTimeNs = monotonicNowNs();
 
     inst.nextTickNs = now + static_cast<int64_t>(inst.tickEveryMs) * 1000000ll;
     return true;
@@ -192,7 +192,7 @@ void SimMarket::publishSnapshot(MarketSnapshotBlock* block) const {
     uint32_t n = 0;
     for (const auto& inst : instruments_) {
         if (n >= kMaxMarketInstruments) break;
-        MarketTickSnap& snap = block->items[n++];
+        MarketTickSnap snap{};
         copyStr(snap.instrument, inst.name);
         snap.lastPrice = inst.lastPrice;
         snap.bidPrice1 = roundToTick(inst.lastPrice - inst.priceTick * inst.spreadTicks * 0.5,
@@ -206,6 +206,9 @@ void SimMarket::publishSnapshot(MarketSnapshotBlock* block) const {
         snap.askVolume1 = inst.askVolume;
         snap.tickTimeNs = nowNs();
         snap.recvTimeNs = snap.tickTimeNs;
+        block->items[n].setInstrument(inst.name);
+        block->items[n].publish(snap);
+        ++n;
     }
     block->count.store(n, std::memory_order_release);
 }

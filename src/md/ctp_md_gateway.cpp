@@ -178,7 +178,7 @@ TickMsg CtpMdGateway::convert(const CThostFtdcDepthMarketDataField& f) const {
     t.volume = static_cast<double>(f.Volume);
     t.turnover = f.Turnover;
     t.openInterest = f.OpenInterest;
-    t.recvTimeNs = wallNowNs();
+    t.recvTimeNs = monotonicNowNs();
     return t;
 }
 
@@ -189,7 +189,7 @@ void CtpMdGateway::OnRtnDepthMarketData(CThostFtdcDepthMarketDataField* pDepthMa
     // migration of the hot producer/consumer pair.
     pinCurrentThreadOnce(workerCpu_, workerPin_);
     TickMsg t = convert(*pDepthMarketData);
-    t.publishTimeNs = wallNowNs();
+    t.publishTimeNs = monotonicNowNs();
     tickSink_(t);
 }
 

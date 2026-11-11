@@ -54,6 +54,7 @@ set(HFT_COMMON_SOURCES
     src/common/process_app.cpp
     src/sim/sim_market.cpp
     src/sim/sim_matcher.cpp
+    third_party/fmtlog/fmtlog.cc
 )
 
 set(HFT_INCLUDE_DIRS "${HFT_ROOT}/include" "${HFT_ROOT}/third_party/fmtlog")
@@ -112,7 +113,7 @@ add_hft_process(query_proc
 
 add_hft_process(strategy_proc
     src/strategy/strategy_main.cpp
-    src/strategy/ma_tick_strategy.cpp
+    src/strategy/obi_voi_strategy.cpp
     ${HFT_COMMON_SOURCES})
 
 # Read-only observer of the shared bus (optional, very handy in production).
