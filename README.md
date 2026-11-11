@@ -282,7 +282,7 @@ objdump -p build\bin\md_proc.exe | findstr "DLL Name"
 `config_verify.ini` 是为了回答"这套东西到底能不能下单"：obi 门槛 0.85、tp10/sl6、
 日亏损上限 120 tick、全时段可开仓。跑它能在几分钟内看到完整的
 `SIGNAL -> ORDER -> TRADE -> ROUND TRIP`，用来排除"没信号"和"链路断了"的混淆。
-纯仿真下用 `_simfill.bat`（不需要柜台和网络）验证同一件事。
+纯仿真下用 `verify_sim.bat`（不需要柜台和网络）验证同一件事。
 
 ```ini
 [account]
@@ -752,7 +752,7 @@ tp8/sl6），模拟给出 −4.90 tick/笔，实盘实测 −1.65 tick/笔（同
 触发都追不回来），但说明**统计盈亏必须剔除单笔 >20 tick 的离群值**，否则一天的数字全是噪音。
 
 **验证配置**：`config_verify.ini`（对应 `build\bin_simnow`）。全时段可开仓、obi 0.85、
-tp10/sl6、日亏损上限 120 tick，专用于"证明链路通"而不是赚钱。跑 `_simfill.bat`
+tp10/sl6、日亏损上限 120 tick，专用于"证明链路通"而不是赚钱。跑 `verify_sim.bat`
 可以在纯仿真下 5 秒内看到 `SIGNAL -> ORDER -> TRADE -> ROUND TRIP` 全链路。
 
 **没做、也不建议做的**：
