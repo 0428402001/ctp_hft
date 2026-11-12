@@ -49,3 +49,5 @@ nul
 # local archives
 *.rar
 *.7z
+
+.workbuddy/
