@@ -157,7 +157,7 @@ ROUND_RE = re.compile(
 
 
 def summarize(tag: str, cfg: str, offs: dict[str, int], window: tuple[dt.datetime, dt.datetime],
-              restarts: dict[str, int], ready: dict[str, str]) -> Path:
+              restarts: dict[str, int], ready: dict[str, str], acct_txt: str = "") -> Path:
     strat = read_since("strategy", offs["strategy"])
     md = read_since("md", offs["md"])
     trader = read_since("trader", offs["trader"])
@@ -178,8 +178,8 @@ def summarize(tag: str, cfg: str, offs: dict[str, int], window: tuple[dt.datetim
     execs = [int(x) for x in re.findall(r"execs=(\d+) ", strat)]
     backlogs = [int(x) for x in re.findall(r"backlog=(\d+)", strat)]
 
-    acct = run([str(ROOT / "build" / "bin_simnow" / "account_peek.exe")])
-    acct_txt = dec(acct.stdout).strip()
+    if not acct_txt:
+        acct_txt = dec(run([str(ROOT / "build" / "bin_simnow" / "account_peek.exe")]).stdout).strip()
 
     md_login = len(re.findall(r"md status: logged in", md))
     settle = len(re.findall(r"settlement confirmed", trader))
@@ -285,11 +285,18 @@ def run_session(s: dict, cfg: str, bin_dir: Path, fronts: list[tuple[str, int]])
                 say(f"{tag}: first tick received")
 
     say(f"{tag}: session over, stopping")
+    # snapshot the account BEFORE tearing the bus down: account_peek reads the
+    # shared-memory snapshot, which disappears with the processes.
+    acct_txt = ""
+    try:
+        acct_txt = dec(run([str(ROOT / "build" / "bin_simnow" / "account_peek.exe")]).stdout).strip()
+    except Exception as e:
+        acct_txt = f"account_peek failed: {e}"
     for name in ("strategy_proc", "trader_proc", "query_proc", "md_proc"):
         subprocess.run(["taskkill", "/f", "/im", f"{name}.exe"], cwd=str(ROOT),
                        capture_output=True)
         time.sleep(1)
-    summarize(tag, cfg, offs, (started, dt.datetime.now()), restarts, ready)
+    summarize(tag, cfg, offs, (started, dt.datetime.now()), restarts, ready, acct_txt)
 
 
 def main() -> int:
