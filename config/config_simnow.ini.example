@@ -83,7 +83,7 @@ name = obi_voi
 ;  came from a 1.5-day sample (night +4.13 / day -4.89 tick per trip) - too
 ;  2026-11-12 follow mode: the measured edge lives in the DAY session
 ;  (day momentum +2.15t / night +0.93t t=0.43, alpha_composite.py).
-trade_sessions     = 09:00-15:00
+trade_sessions     = 09:00-10:15,10:30-11:30,13:30-15:00,21:00-02:30
 ; Stall filter: price must have come off the recent extreme by N ticks.
 entry_stall_ticks  = 0
 stall_window_ticks = 6

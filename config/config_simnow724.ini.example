@@ -93,7 +93,7 @@ name = obi_voi
 ;  to trade only then; exits are never gated either way.
 ;  2026-11-12 follow mode: the measured edge lives in the DAY session
 ;  (day momentum +2.15t / night +0.93t t=0.43, alpha_composite.py).
-trade_sessions     = 09:00-15:00
+trade_sessions     = 16:00-09:00
 window_ticks       = 16      ; back to 16: the 16 -> 10 change was made together
                               ;   with a stall filter that was later measured and
                               ;   switched off, so the shorter window lost its reason.
