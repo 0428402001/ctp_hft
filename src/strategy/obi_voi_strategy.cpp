@@ -61,7 +61,10 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
     // opponent price and sends IOC so the signal actually lands.
     entryTaker_ = cfg.getBool("obi_voi", "entry_taker", false);
     profitTicks_ = cfg.getInt("obi_voi", "profit_ticks", 2);
-    makerMode_ = (cfg.getString("obi_voi", "entry_mode", "fade") == "maker");
+    const std::string entryMode = cfg.getString("obi_voi", "entry_mode", "fade");
+    makerMode_ = (entryMode == "maker");
+    followMode_ = (entryMode == "follow");
+    followPatienceMs_ = cfg.getInt("obi_voi", "follow_patience_ms", 3000);
     makerThinThreshold_ = cfg.getInt("obi_voi", "maker_thin_threshold", 0);
     closeTimeoutTicks_ = cfg.getInt("obi_voi", "close_timeout_ticks", 3);
     stopLossTicks_ = cfg.getInt("obi_voi", "stop_loss_ticks", 3);
@@ -165,7 +168,7 @@ bool ObiVoiStrategy::init(const Config& cfg, StrategyContext& ctx, std::string& 
              "entrySlip=%dt taker=%s profit=%dt closeTimeout=%dt stopLoss=%dt stopSlip=%dt maxHold=%dt "
              "tpRepost=%d/%dt maxSpread=%dt trend=%dms/%dt vol=%d maxPos=%d short=%s | maxHoldSec=%d "
              "escapeRetry=%dms consecStop=%d/%ds stall=%dt/%dw be=%dt blackout=%ds dayLoss=%dt",
-             makerMode_ ? "maker" : "fade", windowTicks_, obiThreshold_, voiEmaTicks_,
+             makerMode_ ? "maker" : (followMode_ ? "follow" : "fade"), windowTicks_, obiThreshold_, voiEmaTicks_,
              voiFlipThreshold_, voiEntryThreshold_, entryTimeoutTicks_, entrySlippageTicks_,
              entryTaker_ ? "ioc" : "gfd",
              profitTicks_, closeTimeoutTicks_, stopLossTicks_, stopSlippageTicks_,
@@ -426,7 +429,7 @@ void ObiVoiStrategy::onTick(const TickMsg& tick) {
                 st.retryEntryDir = '0';
                 st.retryEntryUntilNs = 0;
                 HFT_LOGI("%s: entry IOC unfilled -> retry crossing 1 tick", tick.instrument);
-                sendEntry(st, tick, dir, 1);
+                sendEntry(st, tick, dir, 1, followMode_);
                 return;
             }
             st.retryEntryDir = '0';
@@ -786,6 +789,31 @@ void ObiVoiStrategy::evaluate(State& st, const TickMsg& tick) {
     if (ctx_->brokerPosition(tick.instrument, bp) && bp.net != 0) return;
     if (!st.startupDone) return;
 
+    // ---- follow mode: ride the imbalance extreme, do NOT fade it -----------
+    // The whole fade apparatus below (drift gate, stall filter, VOI decay
+    // confirmation) exists to answer "has the move exhausted itself". The
+    // 2026-11-12 measurement said the answer does not pay on this tape: at
+    // minute horizons the extreme CONTINUES (day session +2.15t over 480
+    // ticks, t=1.95) and every confirmation filter we tried (VOI sign, VOI
+    // magnitude, high-vol regime) made the edge worse. So follow mode is
+    // deliberately dumb: the current OBI is extreme -> go with it. No
+    // fadeSign is set, which also keeps the VOI pull-guard inert.
+    if (followMode_) {
+        const double obiNow = st.obiBack();
+        if (obiNow >= obiThreshold_) {
+            st.signalCount++;
+            HFT_LOGI("SIGNAL %s FOLLOW-BID-EXTREME obi=%.2f -> BUY @ bid %.2f",
+                     tick.instrument, obiNow, tick.bidPrice1);
+            sendEntry(st, tick, Dir::Buy);
+        } else if (obiNow <= -obiThreshold_ && allowShort_) {
+            st.signalCount++;
+            HFT_LOGI("SIGNAL %s FOLLOW-ASK-EXTREME obi=%.2f -> SELL @ ask %.2f",
+                     tick.instrument, obiNow, tick.askPrice1);
+            sendEntry(st, tick, Dir::Sell);
+        }
+        return;
+    }
+
     // ---- maker mode: quote the touch on the side of the last print ---------
     // In a 1-tick oscillating replay the only positive-expectancy structure
     // is passive/passive spread capture: join the bid right after a seller
@@ -983,8 +1011,16 @@ void ObiVoiStrategy::manageWorkingOrder(State& st, const TickMsg& tick) {
         //     can mean 2-4 seconds of exposure.  An absolute 800 ms ceiling
         //     makes the pull prompt regardless of the tick rate (the counter
         //     usually auto-cancels first - this is the belt to that braces).
+        //     Follow mode is deliberately more patient: its edge lives for
+        //     minutes, so the passive quote gets follow_patience_ms on the
+        //     wall clock before the taker fallback; the tick count is ignored
+        //     there because 2 tick/s tape would otherwise pull it in 2 s.
         const int64_t ageNs = p.sentTimeNs ? (nowNs() - p.sentTimeNs) : 0;
-        if (p.ticksSinceSend >= entryTimeoutTicks_ || ageNs >= INT64_C(800000000)) {
+        const int64_t patienceNs =
+            followMode_ ? static_cast<int64_t>(followPatienceMs_) * 1000000ll
+                        : INT64_C(800000000);
+        if ((!followMode_ && p.ticksSinceSend >= entryTimeoutTicks_) ||
+            ageNs >= patienceNs) {
             HFT_LOGI("PULL %s: entry not filled within %d ticks / %lld ms -> cancel",
                      tick.instrument, entryTimeoutTicks_,
                      static_cast<long long>(ageNs / 1000000));
@@ -1034,7 +1070,8 @@ void ObiVoiStrategy::manageWorkingOrder(State& st, const TickMsg& tick) {
 // ---------------------------------------------------------------------------
 //  order helpers
 // ---------------------------------------------------------------------------
-void ObiVoiStrategy::sendEntry(State& st, const TickMsg& tick, Dir dir, int extraTicks) {
+void ObiVoiStrategy::sendEntry(State& st, const TickMsg& tick, Dir dir, int extraTicks,
+                               bool forceTaker) {
     const int net = ctx_->position(tick.instrument);
     if (net != 0) return;  // inventory cap: at the limit only closes are allowed
 
@@ -1046,7 +1083,8 @@ void ObiVoiStrategy::sendEntry(State& st, const TickMsg& tick, Dir dir, int extr
     const double tickSize = ctx_->priceTick(tick.instrument);
     double px;
     char timeCond = '1';              // GFD - rests on the book
-    if (entryTaker_) {
+    const bool taker = entryTaker_ || forceTaker;
+    if (taker) {
         // Cross the spread (+ slip) and demand an immediate fill.  A resting
         // quote on the SimNow 7x24 front is auto-cancelled 100-500 ms after it
         // lands, so a passive entry only burns the signal.
@@ -1107,7 +1145,7 @@ void ObiVoiStrategy::sendEntry(State& st, const TickMsg& tick, Dir dir, int extr
     st.orderCount++;
 
     char why[48];
-    if (entryTaker_) {
+    if (taker) {
         const int slipTicks = entrySlippageTicks_ + extraTicks;
         if (slipTicks > 0) {
             std::snprintf(why, sizeof(why), "taker: %s+%dt",
@@ -1124,7 +1162,7 @@ void ObiVoiStrategy::sendEntry(State& st, const TickMsg& tick, Dir dir, int extr
     }
     HFT_LOGI("ORDER %s %s OPEN vol=%d LIMIT @ %.2f (%s, %s, cmdId=%u)", tick.instrument,
              dir == Dir::Buy ? "BUY" : "SELL", tradeVolume_, px, why,
-             entryTaker_ ? "IOC" : "GFD", cmdId);
+             taker ? "IOC" : "GFD", cmdId);
 }
 
 // Passive take profit close: resting on the weak side of the CLOSE direction
@@ -1740,7 +1778,13 @@ void ObiVoiStrategy::onExec(const ExecReport& report) {
                     // retry lands ~2 s later (cancel report + grace window +
                     // next tick) by which time the book has moved - paying one
                     // tick up front is cheaper than that delay.
-                    if (entryTaker_ && entrySlippageTicks_ == 0 && report.direction != '0') {
+                    //
+                    // Follow mode reuses the same slot as its maker->taker
+                    // fallback: the passive quote timed out unfilled, so the
+                    // retry (sent with forceTaker) crosses a tick as an IOC.
+                    if ((followMode_ ||
+                         (entryTaker_ && entrySlippageTicks_ == 0)) &&
+                        report.direction != '0') {
                         st.retryEntryDir = report.direction;
                         st.retryEntryUntilNs = nowNs() + INT64_C(1500000000);
                     }

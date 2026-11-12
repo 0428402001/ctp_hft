@@ -90,10 +90,10 @@ name = obi_voi
 ; ---------------------------------------------------------------------------
 ;  Entry windows. EMPTY = no restriction: entries are allowed around the clock.
 ;  Set one or more windows, e.g. "21:00-02:30" or "21:00-02:30,09:00-10:15",
-;  to trade only then; exits are never gated either way. The night-only window
-;  came from a 1.5-day sample (night +4.13 / day -4.89 tick per trip) - too
-;  small to trust, so the default runs 24 h and keeps collecting samples.
-trade_sessions     =
+;  to trade only then; exits are never gated either way.
+;  2026-11-12 follow mode: the measured edge lives in the DAY session
+;  (day momentum +2.15t / night +0.93t t=0.43, alpha_composite.py).
+trade_sessions     = 09:00-15:00
 window_ticks       = 16      ; back to 16: the 16 -> 10 change was made together
                               ;   with a stall filter that was later measured and
                               ;   switched off, so the shorter window lost its reason.
@@ -103,9 +103,13 @@ obi_threshold      = 0.90    ; 0.92 -> 0.90 together with window 16 -> 10: the
 voi_ema_ticks      = 5
 voi_flip_threshold = 0.35
 voi_entry_threshold = 0.1    ; |VOI| minimum that confirms the reversal (0 = sign only)
+entry_mode         = follow ; 2026-11-12: fade -> follow. Measured on 162827 ag2702
+                            ;   ticks (alpha_composite.py): fading an |OBI|>=0.90 extreme
+                            ;   paid -2.15t over 480 ticks in the day session, FOLLOWING
+                            ;   it paid +2.15t (t=1.95).
 entry_timeout_ticks = 4
-entry_taker        = 1      ; 7x24 front cancels resting quotes in 100-500ms: cross + IOC,
-                            ; so a signal always lands (costs 0-1 tick of slippage)
+entry_taker        = 0      ; follow mode is maker-first: rest at the touch, then fall
+follow_patience_ms = 3000   ;   back to one taker IOC (crossing 1 tick) after 3 s unfilled.
 profit_ticks       = 16     ; 8 -> 16. At 8 the winners printed +7..+9 while the
                             ;   stops printed -6..-9 (2026-11-10 live: 31 trips,
                             ;   32 % win, -51 tick). 16/8 gives R:R 2.0, which is
@@ -118,7 +122,8 @@ stop_slippage_ticks = 2     ; a limit IOC prints at the best level that has volu
                             ;   order still reaches a level with bids/offers. 1 tick missed
                             ;   the fill outright in the 11:08 run; 2 reaches the next level.
 max_hold_ticks     = 0      ; off - the TP/SL bracket is the exit (safety net only if set)
-max_hold_seconds   = 600    ; HARD wall-clock stop: 10 min holding -> IOC escape at any price
+max_hold_seconds   = 300    ; HARD wall-clock stop: 5 min holding -> IOC escape at any
+                            ;   price (follow edge measured at h<=480 ticks, ~4 min).
                             ; (2026-11-05 18:40 an ag short sat open 14 h because its
                             ;  escape IOC was cancelled and nothing retried it)
 escape_retry_ms    = 800    ; min gap between escape IOC attempts; the cross widens

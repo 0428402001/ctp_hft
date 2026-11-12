@@ -81,8 +81,9 @@ name = obi_voi
 ;  Set one or more windows, e.g. "21:00-02:30" or "21:00-02:30,09:00-10:15",
 ;  to trade only then; exits are never gated either way. The night-only window
 ;  came from a 1.5-day sample (night +4.13 / day -4.89 tick per trip) - too
-;  small to trust, so the default runs 24 h and keeps collecting samples.
-trade_sessions     =
+;  2026-11-12 follow mode: the measured edge lives in the DAY session
+;  (day momentum +2.15t / night +0.93t t=0.43, alpha_composite.py).
+trade_sessions     = 09:00-15:00
 ; Stall filter: price must have come off the recent extreme by N ticks.
 entry_stall_ticks  = 0
 stall_window_ticks = 6
@@ -104,10 +105,13 @@ obi_threshold      = 0.90    ; same measured set as the 7x24 config
 voi_ema_ticks      = 5
 voi_flip_threshold = 0.35
 voi_entry_threshold = 0.1    ; |VOI| minimum that confirms the reversal (0 = sign only)
+entry_mode         = follow ; 2026-11-12: fade -> follow. Measured on 162827 ag2702
+                            ;   ticks (alpha_composite.py): fading an |OBI|>=0.90 extreme
+                            ;   paid -2.15t over 480 ticks in the day session, FOLLOWING
+                            ;   it paid +2.15t (t=1.95).
 entry_timeout_ticks = 4
-entry_taker        = 1      ; IOC at the opponent price: SimNow cancels a resting
-                            ;   quote within 80-300 ms (measured 2026-11-06), so a passive
-                            ;   entry only burns the signal - 5 fills out of 19 orders.
+entry_taker        = 0      ; follow mode is maker-first: rest at the touch, then fall
+follow_patience_ms = 3000   ;   back to one taker IOC (crossing 1 tick) after 3 s unfilled.
 profit_ticks       = 16     ; 8 -> 16: R:R 2.0 is what a 55-62 % win rate needs
 close_timeout_ticks = 6
 stop_loss_ticks    = 8      ; 6 -> 8: 6 sits inside the ag noise band
@@ -116,7 +120,8 @@ stop_slippage_ticks = 2     ; a limit IOC prints at the best level that has volu
                             ;   order still reaches a level with bids/offers. 1 tick missed
                             ;   the fill outright in the 11:08 run; 2 reaches the next level.
 max_hold_ticks     = 0      ; off - the TP/SL bracket is the exit (safety net only if set)
-max_hold_seconds   = 600    ; HARD wall-clock stop: 10 min holding -> IOC escape at any price
+max_hold_seconds   = 300    ; HARD wall-clock stop: 5 min holding -> IOC escape at any
+                            ;   price (follow edge measured at h<=480 ticks, ~4 min).
                             ; (2026-11-05 18:40 an ag short sat open 14 h because its
                             ;  escape IOC was cancelled and nothing retried it)
 escape_retry_ms    = 800    ; min gap between escape IOC attempts; the cross widens

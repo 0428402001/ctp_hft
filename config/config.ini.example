@@ -84,7 +84,7 @@ name = obi_voi
 [obi_voi]
 ; Aggressive settings on purpose: the point of this file is to produce a fill
 ; within seconds, not to make money. Do NOT copy these to a live config.
-entry_mode         = fade
+entry_mode         = follow
 ; ---------------------------------------------------------------------------
 ;  L1 order book imbalance fade strategy
 ;  OBI  = (bidVol1 - askVol1) / (bidVol1 + askVol1)
@@ -113,7 +113,8 @@ cooldown_ticks     = 4
 allow_short        = true
 flatten_on_start   = true
 close_on_stop      = true
-entry_taker        = 1
+entry_taker        = 0
+follow_patience_ms = 2000
 max_spread_ticks   = 3
 entry_stall_ticks  = 0
 entry_blackout_sec = 300

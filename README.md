@@ -532,35 +532,46 @@ build\bin\strategy_proc.exe --config config\config_simnow.ini
 > 差异只在三个 CTP 进程的编译宏（`HFT_CTP_STD`，见 `src/common/ctp_compat.h`）：
 > 标准版多结算单确认、`Init()` 签名不同；策略、共享内存、队列完全一致。
 
-## 7. 策略 obi_voi（L1 失衡反转 + 括号单）
+## 7. 策略 obi_voi（L1 失衡信号 + 括号单）
 
-`src/strategy/obi_voi_strategy.cpp`：基于一档盘口的订单流失衡做**反转（fade）**。
-**纯回报驱动**——`onTick` 只做决策，一切成交/撤单以 `OnRtnOrder` / `OnRtnTrade` 回报为准。
+`src/strategy/obi_voi_strategy.cpp`：基于一档盘口的订单流失衡（OBI）。**纯回报驱动**——
+`onTick` 只做决策，一切成交/撤单以 `OnRtnOrder` / `OnRtnTrade` 回报为准。
+
+**`entry_mode` 三选一（2026-11-12 起默认 `follow`）：**
+
+| 模式 | 方向 | 入场 | 依据 |
+|---|---|---|---|
+| `follow`（当前） | **顺势**：买盘极端做多、卖盘极端做空 | maker 优先：挂 touch 价，`follow_patience_ms`（3 s）未成交 → 跨 1 tick IOC 兜底 | 162,827 tick 实测：日盘 h=480（约 4 分钟）edge **+2.15t（t=1.95）** |
+| `fade`（历史默认） | 反转：买盘极端做空、卖盘极端做多 | taker IOC | 同批数据实测 **−2.15t**，41 笔实盘 −2.3t/笔，已弃用 |
+| `maker` | 被动双边吃价差 | 纯挂单 | 仅用于 1-tick 震荡回放 |
+
+关键测量（`tools/alpha_composite.py`，ag2702，50 小时 tape）：四象限里只有
+**日盘 × 动量** 为正；夜盘 × 反转（旧配置）恰好是最差象限。VOI 确认、高波动过滤
+均被实测证明**有害**（t = −4.5），follow 模式因此刻意不用任何确认条件。
+注意：+2.15t 的毛 edge 减去混合执行成本（maker 成交省跨价）后净利润仍薄，
+且 t≈2 只是边际显著——**样本外验证通过前不要加仓**。
 
 ### 7.1 信号
 
 * `OBI = (bidVol1 − askVol1) / (bidVol1 + askVol1)`，一档挂单失衡；
-* `VOI = EMA(带符号主动成交量) / EMA(|主动成交量|)`，按最新价方向给增量定号，衡量主动流方向；
-* **条件 A（极端）**：`window_ticks`（20）内 |OBI| 曾超过 `obi_threshold`（0.95）；
-* **条件 B（衰竭）**：VOI 已反向且幅度 ≥ `voi_entry_threshold`（0.1）；
-* **条件 C（衰减确认）**：**当前** OBI 已从极值回落（越过 `threshold − margin`）——
-  只在“极端正在瓦解”时入场，而不是在极端最强时逆势硬顶；
-* 三个条件同时成立 → 在**弱势侧** fade（买盘极端就卖、卖盘极端就买）；
+* `VOI = EMA(带符号主动成交量) / EMA(|主动成交量|)`，衡量主动流方向（仅 fade 模式使用）；
+* **follow 模式**：当前 OBI 越过 `obi_threshold`（0.90）即顺势入场，无确认条件；
+* fade 模式（已停用）的三条件：A 窗口内 |OBI| 曾越阈、B VOI 反向确认、C 当前 OBI 已从极值回落；
 * 每个方向有 `armed` 门控：一次触发后需 VOI 重新回到该方向才解锁，避免同一段行情连打。
 
 ### 7.2 交易规则
 
 | 场景 | 行为 |
 |---|---|
-| A+B+C 成立 | 弱势侧入场。`entry_taker=1` 时跨 1 tick 对手价 + IOC，保证落到 |
+| A+B+C 成立（fade）/ OBI 越阈（follow） | 入场。follow 模式 maker 优先（挂 touch 价，3 s 未成交 → 跨 1 tick IOC）；`entry_taker=1` 时直接跨价 IOC |
 | 盘口价差 > `max_spread_ticks`（1 tick） | **跳过入场**——目标价从成交价起算，多 1 tick 价差就多 1 tick 要走。实测：spread≤1 → +4.06 tick/笔，≤2 → −0.60 |
-| 入场 `entry_timeout_ticks`（4 tick）未成交 | 撤单，回冷却 |
+| 入场超时未成交 | fade：撤单回冷却；follow：撤单后以 IOC 兜底重试一次，仍不成则放弃该信号 |
 | **入场成交的瞬间** | 立刻挂止盈限价单 @ `entry ± profit_ticks`（16 tick），**GFD，永不主动撤** |
 | 价格逆向触及 `entry ∓ stop_loss_ticks`（8 tick） | 撤掉止盈单 → IOC 止损，跨 `stop_slippage_ticks`（2 tick）确保成交 |
 | 止盈单被柜台/对手撤掉 | 按 `tp_repost_interval_ticks`（20 tick）节奏补挂，最多 `tp_repost_max`（8）次 |
 | 补挂耗尽仍未成交 | 退化为纯价格触发 IOC 退出，不再挂单 |
 | 价格触及目标且无在途止盈单 | 以**目标价**为限价的 IOC 落袋——跑过目标时成交在更优买/卖价，回抽时不成交 |
-| 持仓超 `max_hold_seconds`（600 s） | **硬墙钟兜底**：无条件 IOC 逃逸，任何价格 |
+| 持仓超 `max_hold_seconds`（300 s） | **硬墙钟兜底**：无条件 IOC 逃逸，任何价格 |
 | 逃逸 IOC 被撤（status=5, filled=0） | 800 ms 后重发，每 **2** 次跨价 +1 tick（最多 +6） |
 | 平仓 offset 被拒 | 环形回退 `平今(3) → 平昨(4) → 平仓(1)`，适配 SHFE 的今昨仓规则 |
 | 逃逸累计 200 次仍不成交 | `haltTrading()` + ERROR 日志（宁停不裸奔） |
@@ -615,7 +626,7 @@ build\bin\strategy_proc.exe --config config\config_simnow.ini
 启动日志会打印生效参数，换版本后第一件事就是核对这一行：
 
 ```
-obi_voi: mode=fade window=10 obiTh=0.90 voiEma=5 voiFlip=0.35 voiEntry=0.10 |
+obi_voi: mode=follow window=16 obiTh=0.90 voiEma=5 voiFlip=0.35 voiEntry=0.10 |
 entryTimeout=4t entrySlip=1t taker=ioc profit=16t closeTimeout=6t stopLoss=8t stopSlip=2t
 maxHold=0t tpRepost=0/20t maxSpread=1t trend=30000ms/1t vol=1 maxPos=1 short=yes |
 maxHoldSec=600 escapeRetry=800ms consecStop=3/180s

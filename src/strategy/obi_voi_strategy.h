@@ -298,7 +298,8 @@ private:
     void pumpFlatten(State& st, const TickMsg& tick);
 
     // ---- order helpers -------------------------------------------------------
-    void sendEntry(State& st, const TickMsg& tick, Dir dir, int extraTicks = 0);
+    void sendEntry(State& st, const TickMsg& tick, Dir dir, int extraTicks = 0,
+                   bool forceTaker = false);
     void sendClosePassive(State& st, const TickMsg& tick);
     // escape/taker close: IOC at the opponent price crossed by extraSlipTicks
     // (stop orders pass stopSlippageTicks_ so the fill is virtually certain)
@@ -363,6 +364,18 @@ private:
     bool makerMode_ = false;      // entry_mode=maker: quote the touch on the
                                   // side of the last print and capture the
                                   // spread (for 1-tick oscillating replays)
+    // entry_mode=follow: momentum, the OPPOSITE of fade. Measured on 162,827
+    // ag2702 ticks (2026-11-05..12, tools/alpha_composite.py): following an
+    // |OBI|>=0.90 extreme in the DAY session paid +2.15 tick over 480 ticks
+    // (~4 min, t=1.95), while fading it paid -2.15 and every night-session
+    // variant was noise. VOI confirmation was measured HARMFUL (t=-4.5), so
+    // follow mode uses the raw extreme only - no drift gate, no stall filter,
+    // no VOI confirmation. Entry is maker-first: rest at the touch, and if it
+    // is not filled within follow_patience_ms, fall back to one taker IOC
+    // crossing a tick (the edge lives for minutes, so 3 s of patience is
+    // cheap; the spread saved on filled entries is what pays the fees).
+    bool followMode_ = false;
+    int followPatienceMs_ = 3000; // passive entry lifetime before IOC fallback
     int makerThinThreshold_ = 0;  // quote only when the level we join holds <=
                                   // N lots (0 = off); a thin level sweeps
                                   // through our queue position
