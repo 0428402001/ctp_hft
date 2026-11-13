@@ -22,6 +22,7 @@ Usage
 -----
     set GITHUB_TOKEN=ghp_xxx            # needs `repo` scope
     python tools\\gh_push_api.py
+    python tools\\gh_push_api.py --catch-up   # remote is N commits behind: replay them in order
     python tools\\gh_push_api.py --repo D:\\quant\\ctp_hft --target 0428402001/ctp_hft --branch main
 
 Force-update is intentional: it is used to repair a branch that was pushed out
@@ -77,9 +78,9 @@ def git(repo, *args):
     return subprocess.run(["git", "-C", repo, *args], capture_output=True, check=True).stdout
 
 
-def head_entries(repo):
-    """[(mode, blob_sha, path)] for every file in HEAD."""
-    out = git(repo, "ls-tree", "-r", "-z", "HEAD")
+def entries_of(repo, rev):
+    """[(mode, blob_sha, path)] for every file in `rev`."""
+    out = git(repo, "ls-tree", "-r", "-z", rev)
     items = []
     for rec in out.split(b"\0"):
         if not rec:
@@ -90,6 +91,10 @@ def head_entries(repo):
             raise SystemExit(f"unsupported tree entry {typ}: {path!r}")
         items.append((mode, sha, path.decode("utf-8")))
     return items
+
+
+def head_entries(repo):
+    return entries_of(repo, "HEAD")
 
 
 def read_objects(repo, shas):
@@ -110,8 +115,8 @@ def read_objects(repo, shas):
     return objs
 
 
-def head_commit_meta(repo):
-    raw = git(repo, "cat-file", "-p", "HEAD")
+def commit_meta(repo, rev):
+    raw = git(repo, "cat-file", "-p", rev)
     headers, _, message = raw.partition(b"\n\n")
     parents, author, committer = [], None, None
     for line in headers.decode("utf-8", "replace").splitlines():
@@ -122,6 +127,10 @@ def head_commit_meta(repo):
         elif line.startswith("committer "):
             committer = line
     return parents, author, committer, message.decode("utf-8")
+
+
+def head_commit_meta(repo):
+    return commit_meta(repo, "HEAD")
 
 
 def ident_from(line):
@@ -136,11 +145,88 @@ def ident_from(line):
             "date": dt.datetime.fromtimestamp(int(stamp), tz).isoformat()}
 
 
+def upload_blobs(repo, target, token, shas):
+    """Upload blobs and insist every returned sha equals the local one."""
+    objs = read_objects(repo, shas)
+    if len(objs) != len(shas):
+        raise SystemExit("some blobs could not be read from the object store")
+
+    def one(sha):
+        payload = {"content": base64.b64encode(objs[sha]).decode(), "encoding": "base64"}
+        return sha, api("POST", f"/repos/{target}/git/blobs", token, payload)["sha"]
+
+    out = {}
+    with cf.ThreadPoolExecutor(max_workers=8) as pool:
+        for old, new in pool.map(one, shas):
+            out[old] = new
+    changed = [s for s, n in out.items() if s != n]
+    if changed:
+        raise SystemExit(f"content changed on {len(changed)} blob(s) -- aborting")
+    return out
+
+
+def push_chain(repo, target, branch, token, base):
+    """Replay base..HEAD one commit at a time, oldest first.
+
+    The single-commit path above only works while HEAD's parent already exists
+    on the remote. After a stretch offline the remote is N commits behind and
+    POST /git/commits answers 422 "Parent SHA does not exist". This walks the
+    range instead and caches uploaded blobs, so the cost tracks the number of
+    *distinct* blobs, not 120 per commit.
+    """
+    spec = f"{base}..HEAD" if base else "HEAD"
+    commits = git(repo, "rev-list", "--reverse", spec).decode().split()
+    if not commits:
+        print("nothing to push - remote already at HEAD")
+        return 0
+    print(f"{len(commits)} commit(s) to push on top of {base[:12] or '(empty remote)'}")
+
+    cache = {}
+    last = None
+    for idx, sha in enumerate(commits, 1):
+        entries = entries_of(repo, sha)
+        missing = sorted({s for _m, s, _p in entries if s not in cache})
+        if missing:
+            cache.update(upload_blobs(repo, target, token, missing))
+        tree = api("POST", f"/repos/{target}/git/trees", token,
+                   {"tree": [{"path": p, "mode": m, "type": "blob", "sha": cache[s]}
+                             for m, s, p in entries]})["sha"]
+        want = git(repo, "rev-parse", f"{sha}^{{tree}}").decode().strip()
+        if tree != want:
+            raise SystemExit(f"tree mismatch at {sha[:12]} -- aborting")
+        parents, author, committer, message = commit_meta(repo, sha)
+        payload = {"message": message, "tree": tree,
+                   "author": ident_from(author), "committer": ident_from(committer)}
+        if parents:
+            payload["parents"] = parents
+        new = api("POST", f"/repos/{target}/git/commits", token, payload)["sha"]
+        if new != sha:
+            raise SystemExit(f"sha mismatch: local {sha[:12]} remote {new[:12]}")
+        last = new
+        print(f"  [{idx}/{len(commits)}] {sha[:9]} {message.splitlines()[0][:64]}")
+
+    if base:
+        api("PATCH", f"/repos/{target}/git/refs/heads/{branch}", token,
+            {"sha": last, "force": True})
+        print(f"ref updated: {branch} -> {last[:12]}")
+    else:
+        api("POST", f"/repos/{target}/git/refs", token,
+            {"ref": f"refs/heads/{branch}", "sha": last})
+        print(f"ref created: {branch} -> {last[:12]}")
+
+    check = api("GET", f"/repos/{target}/git/trees/{branch}?recursive=1", token)
+    print(f"remote {branch}: {len(check['tree'])} entries, truncated={check.get('truncated')}")
+    print(f"remote sha == local HEAD: {last == git(repo, 'rev-parse', 'HEAD').decode().strip()}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ap.add_argument("--target", default="0428402001/ctp_hft")
     ap.add_argument("--branch", default="main")
+    ap.add_argument("--catch-up", action="store_true",
+                    help="push every commit between the remote branch and HEAD, oldest first")
     args = ap.parse_args()
 
     token = os.environ.get("GITHUB_TOKEN", "").strip()
@@ -150,6 +236,18 @@ def main():
     repo, target, branch = args.repo, args.target, args.branch
     me = api("GET", "/user", token)
     print(f"auth ok: {me['login']}")
+
+    if args.catch_up:
+        try:
+            base = api("GET", f"/repos/{target}/git/ref/heads/{branch}", token)["object"]["sha"]
+        except RuntimeError as e:
+            if "404" not in str(e):
+                raise
+            base = ""
+        if base and subprocess.run(
+                ["git", "-C", repo, "merge-base", "--is-ancestor", base, "HEAD"]).returncode != 0:
+            raise SystemExit(f"remote {base[:12]} is not an ancestor of HEAD - refusing to rewrite history")
+        return push_chain(repo, target, branch, token, base)
 
     entries = head_entries(repo)
     shas = sorted({e[1] for e in entries})
