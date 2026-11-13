@@ -816,10 +816,18 @@ python tools\signal_alpha.py --instr ag2612 --cost
 
 :: 无人值守跑一个完整交易时段（等前置开盘 -> 起四进程 -> 挂了自动重启
 :: -> 收市停 -> 落一份 log\session_<tag>_summary.md）
-python tools\session_run.py --mode auto      :: 今夜 20:50-02:31 + 次日 08:52-15:06
-python tools\session_run.py --mode now       :: 立刻起，02:31 停
+python tools\session_run.py --spawn --mode auto   :: 经 WMI 种到会话之外（推荐）
+python tools\session_run.py --mode auto          :: 今夜 20:50-02:31 + 次日 08:52-15:06
+python tools\session_run.py --mode now           :: 立刻起，02:31 停
 python tools\session_run.py --mode summary --tag night_20261111   :: 重算小结
 ::   进度写在 log\session_run.log，逐条带时间戳
+::   心跳 log\.session_run.heartbeat + pid log\.session_run.pid，供看护判活
+
+:: 看护（常驻，60 s 一次；runner 没了就在窗口内拉起，自身用 49518 端口互斥）
+python tools\watchdog.py --loop        :: 常驻；登录自启已写入 HKCU\...\Run
+python tools\watchdog.py --status      :: 只看不动
+python tools\watchdog.py --force       :: 窗口外也强制拉起
+::   所有动作记在 log\watchdog.log
 
 :: 推代码：本机到 github.com:443 不通，走 api.github.com 的 git-data 接口
 set GITHUB_TOKEN=ghp_xxx                :: classic token，勾 repo
@@ -839,6 +847,7 @@ python tools\gh_push_api.py
 | 现象 | 根因 | 现在的做法 |
 |---|---|---|
 | 进程几分钟后无声消失 | 计划任务实例回收连带杀子进程树 | 常驻 `guard_daemon.py` 持有子进程；任务只拉守护 |
+| 夜盘 4 进程 + runner 在同一毫秒无声全死（11-12 21:03:46） | runner 从 agent/终端会话启动，`DETACHED_PROCESS` 逃不出该会话的 `KILL_ON_JOB_CLOSE` job 对象 | 启动一律 `session_run.py --spawn`（经 WMI `Win32_Process.Create` 种到会话外）；子进程加 `CREATE_BREAKAWAY_FROM_JOB`；`tools/watchdog.py --loop` 60 s 判心跳，配合 `log\.session_run.heartbeat` |
 | `schtasks.exe` 直接“拒绝访问” | 本机安全策略把计划任务工具列入黑名单，不能绕过 | 改用 `session_run.py` 作为常驻进程值守（重启后需手工补位） |
 | 守护进程被 0xC000013A 杀死 | `python.exe` 收 `CTRL_CLOSE_EVENT` | 计划任务改 `pythonw.exe` + 失败重启 |
 | 幽灵回合 `entry=0.00 pnl=+12434` | `OnRtnOrder(AllTraded)` 早于 `OnRtnTrade` | 以 `volumeTraded` 为成交证据 + 宽限窗口 |

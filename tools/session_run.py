@@ -6,9 +6,16 @@ restarts any that die, stops everything at session end and writes a markdown
 summary to log/session_<tag>_summary.md.
 
 Why a long-lived process instead of a scheduled task: the security policy on
-this machine blacklists schtasks.exe, so the runner is launched as a detached
-background process and left alone.  It is therefore *not* reboot-safe - if the
-host or the agent session is killed, relaunch with `--mode now`.
+this machine blacklists schtasks.exe, so the runner is launched through WMI
+(Win32_Process.Create) and left alone.  It is therefore *not* reboot-safe - if
+the host is rebooted, tools/watchdog.py (scheduled task ctp_hft_watchdog) puts
+it back within one tick.
+
+Never start it straight from an agent shell / terminal: those sessions own a
+job object with KILL_ON_JOB_CLOSE, and when that session ends the runner and all
+four children die in the same millisecond - that is exactly what ended
+night_20261112 at 21:03:46, 12 min 40 s after launch, with zero log evidence.
+Use --spawn (or the watchdog) so the runner lives under WmiPrvSE instead.
 
 Usage
   python tools/session_run.py --mode auto          # tonight 20:50 -> 02:31, then 08:52 -> 15:06
@@ -18,6 +25,9 @@ Usage
 from __future__ import annotations
 
 import argparse
+import atexit
+import ctypes
+import ctypes.wintypes as wt
 import datetime as dt
 import io
 import os
@@ -30,6 +40,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 LOG = ROOT / "log"
+PIDFILE = LOG / ".session_run.pid"
+HEARTBEAT = LOG / ".session_run.heartbeat"
 
 
 # --------------------------------------------------------------------------- io
@@ -68,6 +80,137 @@ def read_since(name: str, offset: int) -> str:
 # ---------------------------------------------------------------------- process
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 DETACHED_PROCESS = 0x00000008
+CREATE_NO_WINDOW = 0x08000000
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+JOB_OBJECT_BREAKAWAY_OK = 0x0800 | 0x1000
+
+
+class _BasicLimit(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_uint64) for n in
+                ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                 "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+
+class _ExtendedLimit(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _BasicLimit),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def job_state() -> tuple[bool, int]:
+    """(inside_a_job, limit_flags) for the current process.
+
+    The agent / terminal that starts us often owns a job object with
+    KILL_ON_JOB_CLOSE: when that session goes away every descendant dies at the
+    same instant, silently, including DETACHED_PROCESS children.  This is what
+    killed night_20261112 at 21:03:46.
+    """
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    inside = wt.BOOL()
+    if not k.IsProcessInJob(k.GetCurrentProcess(), None, ctypes.byref(inside)):
+        return False, 0
+    if not inside.value:
+        return False, 0
+    info = _ExtendedLimit()
+    if not k.QueryInformationJobObject(None, 9, ctypes.byref(info), ctypes.sizeof(info), None):
+        return True, 0
+    return True, int(info.BasicLimitInformation.LimitFlags)
+
+
+def spawn_outside_job(argv: list[str], cwd: Path) -> int:
+    """Create a process through WmiPrvSE so it leaves this session's job behind."""
+    cmdline = " ".join(f'"{a}"' for a in argv)
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "$r=Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+        f"-Arguments @{{CommandLine='{cmdline}';CurrentDirectory='{cwd}'}};"
+        "if($r.ReturnValue -ne 0){Write-Output ('ERR ' + $r.ReturnValue);exit 1};"
+        "$r.ProcessId"
+    )
+    r = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+         "-WindowStyle", "Hidden", "-Command", script],
+        capture_output=True, text=True, timeout=90,
+        creationflags=CREATE_NO_WINDOW,
+    )
+    out = (r.stdout or "").strip()
+    if r.returncode != 0 or not out.isdigit():
+        raise RuntimeError((out or r.stderr or "WMI create failed").strip()[:300])
+    return int(out)
+
+
+def beat() -> None:
+    """Liveness stamp for tools/watchdog.py - a killed runner simply stops."""
+    try:
+        HEARTBEAT.write_text(f"{time.time():.0f} {os.getpid()}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _cleanup_pid() -> None:
+    try:
+        if PIDFILE.exists() and PIDFILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            PIDFILE.unlink()
+    except OSError:
+        pass
+
+
+WATCHDOG = ROOT / "tools" / "watchdog.py"
+WATCHDOG_PORT = 49518
+
+
+def pid_alive(pid: int) -> bool:
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    h = k.OpenProcess(0x00100000, False, pid)      # SYNCHRONIZE
+    if not h:
+        return False
+    state = k.WaitForSingleObject(h, 0)
+    k.CloseHandle(h)
+    return state == 0x00000102                    # WAIT_TIMEOUT
+
+
+def other_runner() -> int | None:
+    """Two runners would taskkill each other's children and double the position."""
+    try:
+        pid = int(PIDFILE.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    return pid if pid != os.getpid() and pid_alive(pid) else None
+
+
+def ensure_watchdog() -> None:
+    """A runner without a supervisor is one closed console away from silence."""
+    try:
+        with socket.create_connection(("127.0.0.1", WATCHDOG_PORT), timeout=1.0):
+            return
+    except OSError:
+        pass
+    try:
+        pid = spawn_outside_job([sys.executable, str(WATCHDOG), "--loop"], ROOT)
+        say(f"watchdog started under WmiPrvSE, pid={pid}")
+    except Exception as e:
+        say(f"watchdog start failed: {e}")
+
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -89,12 +232,19 @@ def alive(name: str) -> bool:
 def start_one(name: str, cfg: str, bin_dir: Path) -> subprocess.Popen:
     exe = bin_dir / f"{name}_proc.exe"
     log = io.open(LOG / f"{name}_stdout.txt", "ab")
-    return subprocess.Popen(
-        [str(exe), "--config", cfg, "--mode", "live", "--no-console"],
-        cwd=str(ROOT), stdout=log, stderr=log, stdin=subprocess.DEVNULL,
-        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-        close_fds=True,
-    )
+
+    def _spawn(flags: int) -> subprocess.Popen:
+        return subprocess.Popen(
+            [str(exe), "--config", cfg, "--mode", "live", "--no-console"],
+            cwd=str(ROOT), stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+            creationflags=flags, close_fds=True,
+        )
+    try:
+        return _spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
+    except OSError:
+        # the surrounding job does not allow breakaway - children then die with
+        # the job, which is why the runner itself must be started via --spawn.
+        return _spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
 
 
 # -------------------------------------------------------------------- schedule
@@ -144,6 +294,7 @@ def port_open(host: str, port: int, timeout: float = 2.0) -> bool:
 
 def wait_for_fronts(fronts: list[tuple[str, int]], deadline: dt.datetime) -> bool:
     while dt.datetime.now() < deadline:
+        beat()
         if all(port_open(h, p) for h, p in fronts):
             return True
         time.sleep(10)
@@ -238,6 +389,7 @@ def run_session(s: dict, cfg: str, bin_dir: Path, fronts: list[tuple[str, int]])
     if s["start"] > now:
         say(f"{tag}: waiting until {s['start']:%H:%M}")
         while dt.datetime.now() < s["start"]:
+            beat()
             time.sleep(30)
 
     say(f"{tag}: waiting for fronts {fronts}")
@@ -262,6 +414,7 @@ def run_session(s: dict, cfg: str, bin_dir: Path, fronts: list[tuple[str, int]])
 
     started = dt.datetime.now()
     while dt.datetime.now() < s["stop"]:
+        beat()
         time.sleep(10)
         for name in ("md", "trader", "query", "strategy"):
             if alive(name):
@@ -305,11 +458,40 @@ def main() -> int:
     ap.add_argument("--bin", default="build/bin_simnow")
     ap.add_argument("--mode", default="auto", choices=["auto", "now", "summary"])
     ap.add_argument("--tag", default="")
+    ap.add_argument("--orphan", action="store_true",
+                    help="internal: already detached from the caller's job object")
+    ap.add_argument("--spawn", action="store_true",
+                    help="start a detached runner under WmiPrvSE and return immediately")
+    ap.add_argument("--force", action="store_true",
+                    help="start even when another runner is already alive")
     a = ap.parse_args()
 
     LOG.mkdir(exist_ok=True)
     cfg = a.config
     bin_dir = ROOT / a.bin
+
+    if a.spawn:
+        argv = [sys.executable, str(Path(__file__).resolve()), "--mode", a.mode,
+                "--config", cfg, "--bin", a.bin, "--orphan"]
+        if a.tag:
+            argv += ["--tag", a.tag]
+        if a.force:
+            argv += ["--force"]
+        try:
+            pid = spawn_outside_job(argv, ROOT)
+        except Exception as e:
+            say(f"spawn failed: {e}")
+            return 3
+        say(f"runner spawned outside the session job, pid={pid}")
+        return 0
+
+    if a.mode != "summary" and not a.orphan:
+        inside, flags = job_state()
+        if inside and flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE:
+            say("inside a kill-on-close job -> re-spawning under WmiPrvSE "
+                f"(limitFlags=0x{flags:04X})")
+            return main_spawn(a)
+
     fronts = [f for f in (parse_front(ROOT / cfg, "md"), parse_front(ROOT / cfg, "trader")) if f]
     if not fronts:
         say(f"no front found in {cfg}")
@@ -320,6 +502,17 @@ def main() -> int:
         offs = {"md": 0, "trader": 0, "query": 0, "strategy": 0}
         summarize(tag, cfg, offs, (dt.datetime.now(), dt.datetime.now()), {}, {})
         return 0
+
+    live_runner = other_runner()
+    if live_runner and not a.force:
+        say(f"another runner is alive (pid={live_runner}) - refusing to start, use --force")
+        return 4
+
+    PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
+    atexit.register(_cleanup_pid)
+    beat()
+    ensure_watchdog()
+    say(f"runner pid={os.getpid()} orphan={a.orphan} jobLimitFlags=0x{job_state()[1]:04X}")
 
     now = dt.datetime.now()
     if a.mode == "now":
@@ -336,7 +529,23 @@ def main() -> int:
             run_session(s, cfg, bin_dir, fronts)
         except Exception as e:  # keep the remaining sessions alive
             say(f"{s['tag']}: FAILED {type(e).__name__}: {e}")
+        finally:
+            beat()
     say("all sessions done")
+    return 0
+
+
+def main_spawn(a: argparse.Namespace) -> int:
+    argv = [sys.executable, str(Path(__file__).resolve()), "--mode", a.mode,
+            "--config", a.config, "--bin", a.bin, "--orphan"]
+    if a.tag:
+        argv += ["--tag", a.tag]
+    try:
+        pid = spawn_outside_job(argv, ROOT)
+    except Exception as e:
+        say(f"re-spawn failed, continuing in the original job: {e}")
+        return 0
+    say(f"re-spawned as pid={pid}, leaving this instance")
     return 0
 
 
