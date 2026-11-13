@@ -110,9 +110,10 @@ entry_mode         = follow ; 2026-11-12: fade -> follow. Measured on 162827 ag2
 entry_timeout_ticks = 4
 entry_taker        = 0      ; follow mode is maker-first: rest at the touch, then fall
 follow_patience_ms = 3000   ;   back to one taker IOC (crossing 1 tick) after 3 s unfilled.
-profit_ticks       = 8      ; TP == SL == 8 (R:R 1.0)
+profit_ticks       = 5      ; TP == SL == 5 (R:R 1.0), user spec 2026-11-13
+                            ;   breakeven win rate = (5 + 1.28) / 10 = 62.8 %
 close_timeout_ticks = 6
-stop_loss_ticks    = 8
+stop_loss_ticks    = 5
 stop_slippage_ticks = 2     ; a limit IOC prints at the best level that has volume, so the
                             ;   cross width costs nothing there - it only decides whether the
                             ;   order still reaches a level with bids/offers. 1 tick missed
@@ -154,7 +155,8 @@ entry_stall_ticks  = 0
 stall_window_ticks = 6
 ; Once the trip has printed breakeven_ticks of profit the stop moves to the
 ; entry price and never moves back.
-breakeven_ticks    = 8
+; 0 = off - with profit_ticks = 5 a +8 ratchet could never arm.
+breakeven_ticks    = 0
 ; No new entries in the last 30 minutes of a window. For a 15:00 close,
 ; entries stop at 14:30, avoiding the late-day losses in the 2026-11-10 report.
 entry_blackout_sec = 1800
